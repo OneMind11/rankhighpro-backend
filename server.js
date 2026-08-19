@@ -71,7 +71,7 @@ app.post(
 // Everything else can safely parse JSON normally.
 app.use(cors({ origin: FRONTEND_URL }));
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static('.'));
 
 // ---------------------------------------------------------------------------
 // PRICING TIERS
