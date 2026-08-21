@@ -305,8 +305,19 @@ app.get('/api/gbp-audit', async (req, res) => {
     const isVerified = result.is_claimed ?? null;
     const categories = result.category ? [result.category] : (result.additional_categories || []);
     const hasPhotos = (result.total_photos || 0) > 0;
+    const description = result.description || null;
+    const phone = result.phone || null;
+    const website = result.url || result.domain || null;
+    // DataForSEO has used different field names for work hours across versions —
+    // check the common ones so this doesn't silently break if the schema shifts.
+    const workHours = result.work_time || result.work_hours || result.hours || null;
+    const hasWorkHours = !!(workHours && (Array.isArray(workHours) ? workHours.length : Object.keys(workHours).length));
+    const attributes = result.attributes || null;
 
-    // Build plain-English findings similar in shape to the PageSpeed audit.
+    // -------------------------------------------------------------------
+    // FREE-TIER findings: reviews + rating only. These are the "hook" —
+    // shown in full detail to anyone, no signup required.
+    // -------------------------------------------------------------------
     const findings = [];
 
     if (reviewCount < 30) {
@@ -328,28 +339,84 @@ app.get('/api/gbp-audit', async (req, res) => {
       });
     }
 
+    // -------------------------------------------------------------------
+    // PREMIUM findings: everything else DataForSEO gives us. Computed in
+    // full so the paid tier can unlock them later, but NOT sent in the
+    // free response body — only a count + generic nudge is returned.
+    // -------------------------------------------------------------------
+    const premiumFindings = [];
+
     if (isVerified === false) {
-      findings.push({
+      premiumFindings.push({
         severity: 'error',
         message: 'This listing does not appear to be verified/claimed. Unclaimed listings rank significantly worse.',
       });
     }
 
     if (!hasPhotos) {
-      findings.push({
+      premiumFindings.push({
         severity: 'warn',
         message: 'No photos found on this listing. Listings with regular photo activity tend to rank and convert better.',
       });
     }
 
+    if (categories.length === 0) {
+      premiumFindings.push({
+        severity: 'error',
+        message: 'No business category found. An incomplete or missing category makes it harder for Google to match this listing to relevant searches.',
+      });
+    } else if (categories.length === 1) {
+      premiumFindings.push({
+        severity: 'warn',
+        message: 'Only one business category listed. Adding relevant secondary categories can widen the searches this listing shows up for.',
+      });
+    }
+
+    if (!hasWorkHours) {
+      premiumFindings.push({
+        severity: 'warn',
+        message: 'No business hours listed. Missing hours can hurt trust and click-through in the map pack.',
+      });
+    }
+
+    if (!phone) {
+      premiumFindings.push({
+        severity: 'error',
+        message: 'No phone number found on this listing. A missing phone number makes it harder for customers to contact this business directly from Google.',
+      });
+    }
+
+    if (!website) {
+      premiumFindings.push({
+        severity: 'warn',
+        message: 'No website link found on this listing.',
+      });
+    }
+
+    if (!description || description.trim().length < 50) {
+      premiumFindings.push({
+        severity: 'warn',
+        message: 'Business description is missing or very short. A fuller description gives Google more context to match this listing to relevant searches.',
+      });
+    }
+
+    // -------------------------------------------------------------------
+    // Free response: full detail on reviews/rating, plus a locked count
+    // of everything else the scan found — no specifics, just a nudge.
+    // -------------------------------------------------------------------
     res.json({
       business,
       location: fullLocation,
       rating,
       reviewCount,
-      isVerified,
-      categories,
       findings,
+      locked: {
+        issueCount: premiumFindings.length,
+        message:
+          premiumFindings.length > 0
+            ? `We found ${premiumFindings.length} more issue${premiumFindings.length === 1 ? '' : 's'} affecting this listing's ranking. Sign up to see the full breakdown and start fixing them.`
+            : `No additional issues found in this scan.`,
+      },
     });
   } catch (err) {
     console.error('GBP audit error:', err.message);
