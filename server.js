@@ -254,9 +254,12 @@ app.get('/api/gbp-audit', async (req, res) => {
       return res.status(400).json({ error: 'Missing ?business= or ?location=' });
     }
 
-    // DataForSEO wants "City,State,Country" — if the person only gave
-    // "City, State" we assume United States since that's our target market.
+    // DataForSEO wants "City,State,Country" with NO spaces around the commas
+    // (it must exactly match their internal locations database). We strip
+    // any spaces the user typed around commas, then assume United States
+    // if only "City,State" was given.
     let fullLocation = location.trim();
+    fullLocation = fullLocation.replace(/\s*,\s*/g, ',');
     const commaCount = (fullLocation.match(/,/g) || []).length;
     if (commaCount === 1) {
       fullLocation = fullLocation + ',United States';
