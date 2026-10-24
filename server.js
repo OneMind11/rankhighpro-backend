@@ -161,6 +161,14 @@ async function initDb() {
   `);
   // Fully Managed: setup answers, the team's to-do list and work log, and
   // which monthly reports have gone out.
+  // Stripe events already handled, so a repeat is never processed twice.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stripe_events_seen (
+      event_id TEXT PRIMARY KEY,
+      type TEXT,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS managed_setup (
       customer_id INTEGER PRIMARY KEY,
@@ -201,6 +209,7 @@ async function initDb() {
       PRIMARY KEY (customer_id, month)
     );
   `);
+  await pool.query(`ALTER TABLE managed_setup ADD COLUMN IF NOT EXISTS welcome_sent_at TIMESTAMPTZ;`);
   // Full checkups (whole website + Google listing), run from the AI chat.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS site_checkups (
@@ -1226,6 +1235,31 @@ app.post(
     } catch (err) {
       console.error('Webhook signature check failed:', err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Each Stripe event is handled once. A repeat (Stripe retrying, or someone
+    // pressing Resend in the Stripe dashboard) is ignored, and so is any event
+    // older than 3 days, so an old checkout can never roll a customer back to
+    // an old plan or subscription.
+    try {
+      const ageHours = (Date.now() / 1000 - (event.created || 0)) / 3600;
+      if (ageHours > 72) {
+        console.warn(`Ignored old Stripe event ${event.id} (${event.type}), ${Math.round(ageHours)} hours old.`);
+        return res.json({ received: true, ignored: 'old_event' });
+      }
+      const fresh = await pool.query(
+        `INSERT INTO stripe_events_seen (event_id, type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id`,
+        [event.id, event.type]
+      );
+      if (!fresh.rows.length) {
+        console.warn(`Ignored repeat Stripe event ${event.id} (${event.type}).`);
+        return res.json({ received: true, ignored: 'duplicate' });
+      }
+      if (Math.random() < 0.02) {
+        pool.query(`DELETE FROM stripe_events_seen WHERE received_at < now() - interval '30 days'`).catch(() => {});
+      }
+    } catch (guardErr) {
+      console.error('Stripe event guard error:', guardErr.message);
     }
 
     try {
@@ -9205,11 +9239,23 @@ async function onManagedSignup(customerId, email) {
       }
     }
   } catch (e) { console.error('setup tasks insert:', e.message); }
-  const sent = await sendManagedWelcome(email);
+  // Send the welcome email once. If one went out in the last 30 days
+  // (for example they switched plans and back), don't send it again.
+  let sent = false;
+  let alreadySentAt = null;
+  try {
+    const prior = await pool.query(`SELECT welcome_sent_at FROM managed_setup WHERE customer_id = $1`, [customerId]);
+    const at = prior.rows[0] && prior.rows[0].welcome_sent_at;
+    if (at && Date.now() - new Date(at).getTime() < 30 * 86400000) alreadySentAt = at;
+  } catch (e) { console.error('welcome check:', e.message); }
+  if (!alreadySentAt) {
+    sent = await sendManagedWelcome(email);
+    if (sent) await pool.query(`UPDATE managed_setup SET welcome_sent_at = now() WHERE customer_id = $1`, [customerId]).catch(() => {});
+  }
   notifyAdmin(
     `New Fully Managed client: ${email}`,
     `<p><strong>A new Fully Managed client just signed up ($600/month, billed today).</strong></p>
-     <p>Email: ${htmlEsc(email)}<br>Welcome email with the setup steps: ${sent ? 'sent' : '<strong>NOT sent (check RESEND_API_KEY)</strong>'}</p>
+     <p>Email: ${htmlEsc(email)}<br>Welcome email with the setup steps: ${alreadySentAt ? `already sent on ${new Date(alreadySentAt).toLocaleDateString('en-US')}, not sent again` : sent ? 'sent' : '<strong>NOT sent (check RESEND_API_KEY)</strong>'}</p>
      <p><strong>Do today:</strong></p>
      <ol>
        <li>Call or text them to say hello.</li>
@@ -9663,6 +9709,115 @@ Never say or post: ${a.avoid || 'nothing specified'}`;
 
 // Opens the client's real dashboard with every Pro tool, for 2 hours, in
 // the team member's browser tab only ("team view").
+// ---------------------------------------------------------------------------
+// RE-CHECK A CLIENT'S PLAN WITH STRIPE  (Team Workspace button)
+// Stripe is the truth for who pays for what. This looks up the customer's
+// subscriptions in Stripe by their saved Stripe customer and by email, picks
+// the live one, and makes RankHighPro's plan, status and subscription match.
+// ---------------------------------------------------------------------------
+function planFromStripeSubscription(sub, product) {
+  const keys = Object.keys(PLANS);
+  if (sub && sub.metadata && keys.includes(sub.metadata.plan)) return sub.metadata.plan;
+  if (product && product.metadata && keys.includes(product.metadata.rhp_plan)) return product.metadata.rhp_plan;
+  const item = sub && sub.items && sub.items.data && sub.items.data[0];
+  const amount = item && item.price ? item.price.unit_amount : null;
+  const byAmount = keys.find((k) => PLANS[k].amountCents === amount);
+  if (byAmount) return byAmount;
+  const name = (product && product.name) || '';
+  if (/fully\s*managed/i.test(name)) return 'fullservice';
+  if (/\bpro\b|managed/i.test(name)) return 'managed';
+  if (/grow/i.test(name)) return 'grow';
+  if (/watch/i.test(name)) return 'watch';
+  return null;
+}
+
+async function syncCustomerFromStripe(customerId) {
+  const found = await pool.query(
+    `SELECT id, email, plan, status, stripe_customer_id, stripe_subscription_id FROM customers WHERE id = $1`,
+    [customerId]
+  );
+  const row = found.rows[0];
+  if (!row) return { error: 'Customer not found.' };
+  const before = { plan: row.plan, status: row.status, subscription: row.stripe_subscription_id };
+
+  const stripeCustomerIds = new Set();
+  if (row.stripe_customer_id) stripeCustomerIds.add(row.stripe_customer_id);
+  try {
+    const byEmail = await stripe.customers.list({ email: row.email, limit: 10 });
+    byEmail.data.forEach((c) => stripeCustomerIds.add(c.id));
+  } catch (err) {
+    return { error: `Could not reach Stripe: ${err.message}` };
+  }
+
+  const subs = [];
+  for (const id of stripeCustomerIds) {
+    try {
+      const list = await stripe.subscriptions.list({ customer: id, status: 'all', limit: 20 });
+      subs.push(...list.data);
+    } catch (err) {
+      console.error('sync-stripe list subscriptions:', err.message);
+    }
+  }
+  if (!subs.length) return { error: 'Stripe has no subscriptions for this customer, so nothing was changed.', before };
+
+  const productFor = async (sub) => {
+    const ref = sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price && sub.items.data[0].price.product;
+    if (!ref) return null;
+    try { return typeof ref === 'string' ? await stripe.products.retrieve(ref) : ref; } catch (err) { return null; }
+  };
+  const describe = async (sub) => {
+    const product = await productFor(sub);
+    return {
+      id: sub.id,
+      status: sub.status,
+      plan: planFromStripeSubscription(sub, product),
+      product: product ? product.name : null,
+      started: sub.created ? new Date(sub.created * 1000).toISOString() : null,
+    };
+  };
+
+  const LIVE = ['active', 'trialing', 'past_due', 'unpaid'];
+  const live = subs.filter((x) => LIVE.includes(x.status));
+  if (live.length > 1) {
+    // More than one subscription is live: a person has to decide which one
+    // is real, so nothing is changed here.
+    const list = [];
+    for (const sub of live) list.push(await describe(sub));
+    return { changed: false, needsChoice: true, before, live: list };
+  }
+
+  const best = live[0] || subs.slice().sort((a, b) => (b.created || 0) - (a.created || 0))[0];
+  const info = await describe(best);
+  const plan = info.plan || row.plan;
+  const status = ['active', 'trialing'].includes(best.status) ? 'active'
+    : ['past_due', 'unpaid'].includes(best.status) ? 'past_due' : 'canceled';
+  const stripeCustomerId = typeof best.customer === 'string' ? best.customer : best.customer && best.customer.id;
+
+  await pool.query(
+    `UPDATE customers SET stripe_customer_id = $1, stripe_subscription_id = $2, plan = $3, status = $4 WHERE id = $5`,
+    [stripeCustomerId || row.stripe_customer_id, best.id, plan, status, row.id]
+  );
+  const after = { plan, status, subscription: best.id, stripeStatus: best.status, product: info.product };
+  const changed = before.plan !== after.plan || before.status !== after.status || before.subscription !== after.subscription;
+  return { changed, before, after, liveSubscriptions: live.length };
+}
+
+app.post('/api/team/clients/:id/sync-stripe', requireTeam, async (req, res) => {
+  try {
+    const c = await teamLoadCustomer(req.params.id);
+    if (!c) return res.status(404).json({ error: 'Client not found' });
+    const result = await syncCustomerFromStripe(c.id);
+    if (result.error) return res.status(400).json({ error: result.error });
+    if (result.changed) {
+      await logWork(c.id, null, `Plan re-checked with Stripe: ${result.before.plan || 'none'} -> ${result.after.plan}`, null, 'internal', req.teamMember).catch(() => {});
+    }
+    res.json(result);
+  } catch (err) {
+    console.error('sync-stripe error:', err.message);
+    res.status(500).json({ error: 'Could not check Stripe right now. Try again in a minute.' });
+  }
+});
+
 app.post('/api/team/clients/:id/open-dashboard', requireTeam, async (req, res) => {
   try {
     const c = await teamLoadCustomer(req.params.id);
