@@ -9716,18 +9716,20 @@ Never say or post: ${a.avoid || 'nothing specified'}`;
 // the live one, and makes RankHighPro's plan, status and subscription match.
 // ---------------------------------------------------------------------------
 function planFromStripeSubscription(sub, product) {
+  // What Stripe actually charges decides first; notes stored on the
+  // subscription can be left over from old tests, so they come last.
   const keys = Object.keys(PLANS);
-  if (sub && sub.metadata && keys.includes(sub.metadata.plan)) return sub.metadata.plan;
-  if (product && product.metadata && keys.includes(product.metadata.rhp_plan)) return product.metadata.rhp_plan;
   const item = sub && sub.items && sub.items.data && sub.items.data[0];
   const amount = item && item.price ? item.price.unit_amount : null;
   const byAmount = keys.find((k) => PLANS[k].amountCents === amount);
   if (byAmount) return byAmount;
+  if (product && product.metadata && keys.includes(product.metadata.rhp_plan)) return product.metadata.rhp_plan;
   const name = (product && product.name) || '';
   if (/fully\s*managed/i.test(name)) return 'fullservice';
   if (/\bpro\b|managed/i.test(name)) return 'managed';
   if (/grow/i.test(name)) return 'grow';
   if (/watch/i.test(name)) return 'watch';
+  if (sub && sub.metadata && keys.includes(sub.metadata.plan)) return sub.metadata.plan;
   return null;
 }
 
@@ -9767,11 +9769,14 @@ async function syncCustomerFromStripe(customerId) {
   };
   const describe = async (sub) => {
     const product = await productFor(sub);
+    const item = sub.items && sub.items.data && sub.items.data[0];
     return {
       id: sub.id,
       status: sub.status,
       plan: planFromStripeSubscription(sub, product),
       product: product ? product.name : null,
+      price: item && item.price && item.price.unit_amount != null ? item.price.unit_amount / 100 : null,
+      note: sub.metadata && sub.metadata.plan ? sub.metadata.plan : null,
       started: sub.created ? new Date(sub.created * 1000).toISOString() : null,
     };
   };
@@ -9797,7 +9802,7 @@ async function syncCustomerFromStripe(customerId) {
     `UPDATE customers SET stripe_customer_id = $1, stripe_subscription_id = $2, plan = $3, status = $4 WHERE id = $5`,
     [stripeCustomerId || row.stripe_customer_id, best.id, plan, status, row.id]
   );
-  const after = { plan, status, subscription: best.id, stripeStatus: best.status, product: info.product };
+  const after = { plan, status, subscription: best.id, stripeStatus: best.status, product: info.product, price: info.price, note: info.note };
   const changed = before.plan !== after.plan || before.status !== after.status || before.subscription !== after.subscription;
   return { changed, before, after, liveSubscriptions: live.length };
 }
