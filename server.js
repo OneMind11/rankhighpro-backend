@@ -446,6 +446,46 @@ async function initDb() {
     );
   `);
   // ---------------------------------------------------------------------
+  // AD MAKER (upgrade of video ads)
+  // - video_ads gets the shape, engine, captions and twin flags, plus the
+  //   business name tag image (brand_tag, cleared once it's been applied)
+  //   and the untouched HeyGen file (source_video_url) as a fallback.
+  //   Status 'branding' = HeyGen is done and we're adding the name tag.
+  // - video_twins: one digital twin per customer (the account owner only),
+  //   made from their own footage and their own recorded consent.
+  // - tracked_listings: the name tag colour and logo for each business.
+  // ---------------------------------------------------------------------
+  await pool.query(`
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS video_format TEXT;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS engine TEXT;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS captions BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS is_twin BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS brand_tag TEXT;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS source_video_url TEXT;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS branded BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE video_ads ADD COLUMN IF NOT EXISTS branding_started_at TIMESTAMPTZ;
+    ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS ad_brand_color TEXT;
+    ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS ad_logo TEXT;
+    CREATE TABLE IF NOT EXISTS video_twins (
+      customer_id INTEGER PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'uploading',
+      group_id TEXT,
+      look_id TEXT,
+      voice_id TEXT,
+      engines TEXT,
+      preview_image_url TEXT,
+      consent_status TEXT,
+      consent_url TEXT,
+      consent_url_at TIMESTAMPTZ,
+      error TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      attempts_reset_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      checked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  // ---------------------------------------------------------------------
   // GOOGLE BUSINESS PROFILE CONNECTION
   // One row per customer who has clicked "Connect Google". Holds only the
   // long-lived refresh token, encrypted (AES-256-GCM, same helper used for
@@ -1911,6 +1951,17 @@ app.post('/api/account/delete', requireAuth, async (req, res) => {
        WHERE customer_id = $1 AND business_category IS NOT NULL`,
       [customerId]
     );
+
+    // 2b. Their digital twin (their face and voice) is also removed from
+    //     HeyGen, not just from our database. Best effort: never blocks.
+    try {
+      const twin = await pool.query(`SELECT group_id FROM video_twins WHERE customer_id = $1`, [customerId]);
+      if (twin.rows[0] && twin.rows[0].group_id && process.env.HEYGEN_API_KEY) {
+        await heygenJson('DELETE', `/v3/avatars/${encodeURIComponent(twin.rows[0].group_id)}`);
+      }
+    } catch (e) {
+      console.error('account delete: twin removal at HeyGen failed:', e.message);
+    }
 
     // 3. Erase everything tied to this customer. Table names come from the
     //    database's own schema (never from the request). Affiliate referral
@@ -5031,7 +5082,7 @@ app.post('/api/support-chat', requireAuth, async (req, res) => {
       ? `You are helping a small local business owner (${plan}-tier RankHighPro customer) set up their business listings from scratch — they may need Google Business Profile, Apple Business Connect, or both. These are separate, unrelated platforms: Google Business Profile (google.com/business or the Google Business Profile app) controls Google Maps and Search; Apple Business Connect (businessconnect.apple.com or the Apple Business Connect app) controls Apple Maps, Siri, and Apple Wallet. First figure out which one they're asking about (ask if unclear, or read it from a screenshot they send), then walk them through that one step by step in plain jargon-free language, assuming they're on their phone. For Google: signing in, adding the business, choosing a category, setting location/service area, adding phone and website, and verification (postcard, phone, or email — can take a few days). For Apple: signing in with an Apple ID, searching for an existing listing Apple may have already pulled in (claim it if found, otherwise add a new place), verifying ownership (usually a phone call with a verification code), filling in category/hours/photos/description, and publishing. If they send a screenshot, look at it carefully, identify which platform it's from based on what's shown, and tell them exactly what to tap next. Be warm, patient, and encouraging — this is often the most intimidating first step for a new customer. Keep answers concise — this is a mobile chat interface.`
       : marketingContext && MARKETING_PLATFORM_CONTEXTS[marketingContext]
       ? `You are a marketing specialist helping a small local business owner (${plan}-tier RankHighPro customer) market THEIR OWN business specifically on ${MARKETING_PLATFORM_CONTEXTS[marketingContext]}. They have zero marketing experience — explain everything in plain, jargon-free language, with exact tap-by-tap steps when describing how to use that platform's tools (assume they're on their phone). If they send a screenshot of that platform's app or website, look at it carefully and tell them exactly what to tap next based on what's actually shown. Stay focused on ${MARKETING_PLATFORM_CONTEXTS[marketingContext]} specifically — if they ask about a totally different platform, give a brief answer and suggest they use that platform's own chat box in the "Let's Market Your Business" section for deeper help there. Be warm, direct, and practical. Keep answers concise — this is a mobile chat interface.`
-      : `You are the RankHighPro AI assistant, built into the customer's RankHighPro dashboard. RankHighPro is a local SEO platform that tracks Google Business Profile ranking, checks AI answer-engine visibility (ChatGPT, Gemini, Perplexity, Grok, Claude), generates AI content (Google Business posts, social ads, X posts), sends automated review requests, and helps customers connect their own Twilio account to run text message marketing campaigns. Help this ${plan}-tier customer with questions about their local SEO, their Google Business Profile, how to use RankHighPro's dashboard features (including Twilio/text campaign setup), and general small-business marketing advice. If they send a screenshot, look at it carefully and give specific guidance based on exactly what's shown — for Twilio screenshots, help them find the right button, field, or setting. Be warm, direct, and practical. If asked something outside local SEO, marketing, or RankHighPro's features, answer briefly and steer back to how you can help their ranking. Keep answers concise — this is a mobile chat interface.`;
+      : `You are the RankHighPro AI assistant, built into the customer's RankHighPro dashboard. RankHighPro is a local SEO platform that tracks Google Business Profile ranking, checks AI answer-engine visibility (ChatGPT, Gemini, Perplexity, Grok, Claude), generates AI content (Google Business posts, social ads, X posts), makes ready-to-post video ads in the Ad Maker (Step 7: it writes 3 scripts from their business details, adds captions and their business name on screen, and the presenter can be a stock presenter or the owner's own digital twin made from a 1 to 2 minute video of themselves plus a short recorded OK), sends automated review requests, and helps customers connect their own Twilio account to run text message marketing campaigns. Help this ${plan}-tier customer with questions about their local SEO, their Google Business Profile, how to use RankHighPro's dashboard features (including Twilio/text campaign setup), and general small-business marketing advice. If they send a screenshot, look at it carefully and give specific guidance based on exactly what's shown — for Twilio screenshots, help them find the right button, field, or setting. Be warm, direct, and practical. If asked something outside local SEO, marketing, or RankHighPro's features, answer briefly and steer back to how you can help their ranking. Keep answers concise — this is a mobile chat interface.`;
 
     const cleanHistory = (Array.isArray(history) ? history : []).map((h) => ({ role: h.role, content: h.content }));
 
@@ -7535,15 +7586,28 @@ Requirements:
 // sees HeyGen or a separate charge.
 // ---------------------------------------------------------------------------
 const VIDEO_FORMATS = { phone: '9:16', square: '1:1', wide: '16:9' };
+// What the dashboard gets back for a video (never the name tag image or
+// HeyGen's internal IDs).
+const VIDEO_AD_PUBLIC_COLUMNS = `id, customer_id, tracked_listing_id, avatar_key, avatar_name, script, status, video_url,
+  thumbnail_url, error, created_at, completed_at, video_format, engine, captions, is_twin, branded`;
 
-async function startHeygenVideo(avatarId, voiceId, script, format) {
-  // Stay on the standard engine (what v2 used) when this presenter supports
-  // it; otherwise let HeyGen pick its default.
-  let engine = null;
-  try {
-    const look = (await getHeygenAvatars()).find((a) => a.avatar_id === avatarId);
-    if (look && look.engines.some((e) => String(e).toLowerCase() === 'avatar_iii')) engine = { type: 'avatar_iii' };
-  } catch (e) { /* engine stays default */ }
+// Best-looking engine this presenter supports. Stock presenters use
+// Avatar IV (HeyGen's most lifelike for stock); a customer's own digital
+// twin uses Avatar V when it can. HeyGen bills per minute by engine
+// (stock: Avatar III ~$0.99/min, Avatar IV ~$4.83/min; twin on Avatar V
+// ~$7.20/min), so a 30-second ad is roughly $0.50 / $2.42 / $3.60.
+function pickVideoEngine(engines, isTwin) {
+  const has = (e) => (engines || []).some((x) => String(x).toLowerCase() === e);
+  if (isTwin && has('avatar_v')) return 'avatar_v';
+  if (has('avatar_iv')) return 'avatar_iv';
+  if (has('avatar_v')) return 'avatar_v';
+  if (has('avatar_iii')) return 'avatar_iii';
+  return null; // HeyGen picks its default (Avatar IV)
+}
+
+// opts: { engine, captions }. engine is a pickVideoEngine() result.
+async function startHeygenVideo(avatarId, voiceId, script, format, opts = {}) {
+  const engine = opts.engine || null;
 
   const body = {
     type: 'avatar',
@@ -7553,11 +7617,15 @@ async function startHeygenVideo(avatarId, voiceId, script, format) {
     // cover = zoom the presenter to fill the frame. Without it, a presenter
     // filmed wide shows up as a small strip with blank bars above and below.
     fit: 'cover',
-    resolution: '720p',
+    // Same HeyGen price as 720p, so always the sharper one.
+    resolution: '1080p',
     title: 'RankHighPro video ad',
   };
-  if (voiceId) body.voice_id = voiceId;
-  if (engine) body.engine = engine;
+  if (voiceId) body.voice_id = voiceId; // left out for a twin = their own cloned voice
+  if (engine) body.engine = { type: engine };
+  // Setting a caption style burns the captions into the video itself
+  // (most people watch social video with the sound off).
+  if (opts.captions) body.caption = { file_format: 'srt', style: 'default' };
 
   const response = await fetch('https://api.heygen.com/v3/videos', {
     method: 'POST',
@@ -7613,6 +7681,9 @@ app.post('/api/video-ads/generate', requireAuth, async (req, res) => {
 
     const { avatarId, avatarName, voiceId, script, trackedListingId } = req.body;
     const format = VIDEO_FORMATS[req.body.format] ? req.body.format : 'phone';
+    const useTwin = req.body.useTwin === true;
+    const captions = req.body.captions !== false; // on unless the customer turned it off
+    const brandTag = parseBrandTag(req.body.brandTag); // business name tag image, or null
     const trimmedScript = (script || '').trim();
     if (!trimmedScript) {
       return res.status(400).json({ error: 'A script is required.' });
@@ -7620,13 +7691,53 @@ app.post('/api/video-ads/generate', requireAuth, async (req, res) => {
     if (trimmedScript.length > 700) {
       return res.status(400).json({ error: 'Script is too long — please keep it under roughly 700 characters (about 60-75 seconds spoken).' });
     }
-    if (!avatarId || !voiceId) {
+    if (!useTwin && (!avatarId || !voiceId)) {
       return res.status(400).json({ error: 'Please choose a presenter and a voice.' });
+    }
+    // Honesty rule: the presenter speaks FOR the business, never as a
+    // made-up customer (the FTC fines fake testimonials, AI ones included).
+    const fakeTestimonial = adScriptTestimonialIssue(trimmedScript);
+    if (fakeTestimonial) {
+      return res.status(400).json({ error: `Please change this part of the script: "${fakeTestimonial}". The presenter has to speak for your business ("we", "our team"), not pretend to be a customer. Real customer reviews can't be acted out by an AI presenter.` });
     }
 
     const quota = await checkFeatureAllowed(req.customer.id, 'videoAds');
     if (!quota.allowed) {
       return res.status(403).json({ error: quota.error });
+    }
+
+    // Only HeyGen's public stock presenters, or this customer's OWN twin,
+    // can be used. Twins of other customers (and Ty's private avatar) live
+    // in the same HeyGen account, so the ID is never trusted on its own.
+    let videoAvatarId, videoVoiceId, engine, presenterName;
+    if (useTwin) {
+      const twinR = await pool.query(`SELECT * FROM video_twins WHERE customer_id = $1`, [req.customer.id]);
+      const twin = twinR.rows[0];
+      if (!twin || twin.status !== 'ready' || !twin.look_id) {
+        return res.status(400).json({ error: 'Your digital twin is not ready yet. Pick a stock presenter for now, or finish your twin first.' });
+      }
+      videoAvatarId = twin.look_id;
+      engine = pickVideoEngine(String(twin.engines || '').split(',').filter(Boolean), true);
+      presenterName = 'You (digital twin)';
+      videoVoiceId = null; // their own cloned voice
+      if (voiceId && voiceId !== 'twin') {
+        const voices = await getHeygenVoices();
+        if (!voices.some((v) => v.voice_id === voiceId)) return res.status(400).json({ error: 'Please choose a voice from the list.' });
+        videoVoiceId = voiceId;
+      }
+    } else {
+      const look = (await getHeygenAvatars()).find((a) => a.avatar_id === avatarId);
+      if (!look) {
+        return res.status(400).json({ error: 'Please choose a presenter from the list.' });
+      }
+      const voices = await getHeygenVoices();
+      if (!voices.some((v) => v.voice_id === voiceId)) {
+        return res.status(400).json({ error: 'Please choose a voice from the list.' });
+      }
+      videoAvatarId = look.avatar_id;
+      videoVoiceId = voiceId;
+      engine = pickVideoEngine(look.engines, false);
+      presenterName = (avatarName || look.name || 'Presenter').slice(0, 100);
     }
 
     // trackedListingId is optional (a customer with no listings yet can
@@ -7643,16 +7754,19 @@ app.post('/api/video-ads/generate', requireAuth, async (req, res) => {
 
     let heygenVideoId;
     try {
-      heygenVideoId = await startHeygenVideo(avatarId, voiceId, trimmedScript, format);
+      heygenVideoId = await startHeygenVideo(videoAvatarId, videoVoiceId, trimmedScript, format, { engine, captions });
     } catch (err) {
       console.error('HeyGen start video error:', err.message);
       return res.status(502).json({ error: `Could not start video generation: ${err.message}` });
     }
 
     const result = await pool.query(
-      `INSERT INTO video_ads (customer_id, tracked_listing_id, avatar_key, avatar_name, script, status, heygen_video_id)
-       VALUES ($1, $2, $3, $4, $5, 'processing', $6) RETURNING *`,
-      [req.customer.id, trackedListingId || null, avatarId, (avatarName || 'Presenter').slice(0, 100), trimmedScript, heygenVideoId]
+      `INSERT INTO video_ads (customer_id, tracked_listing_id, avatar_key, avatar_name, script, status, heygen_video_id,
+                              video_format, engine, captions, is_twin, brand_tag)
+       VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9, $10, $11)
+       RETURNING ${VIDEO_AD_PUBLIC_COLUMNS}`,
+      [req.customer.id, trackedListingId || null, useTwin ? 'twin' : videoAvatarId, presenterName, trimmedScript, heygenVideoId,
+       format, engine, captions, useTwin, brandTag]
     );
 
     res.json({ videoAd: result.rows[0] });
@@ -7713,7 +7827,7 @@ app.get('/api/video-ads/:id/download', requireAuth, async (req, res) => {
 app.get('/api/video-ads', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM video_ads WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20`,
+      `SELECT ${VIDEO_AD_PUBLIC_COLUMNS} FROM video_ads WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20`,
       [req.customer.id]
     );
     res.json({ videoAds: result.rows });
@@ -7732,7 +7846,12 @@ app.get('/api/video-ads', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/api/video-ads/avatars', requireAuth, async (req, res) => {
   try {
-    const all = await getHeygenAvatars();
+    const everyone = await getHeygenAvatars();
+    // Only presenters that support Avatar IV, HeyGen's most lifelike engine
+    // for stock presenters, so every customer gets top quality. (If HeyGen
+    // ever stops reporting engines, show everyone rather than nobody.)
+    const best = everyone.filter((a) => pickVideoEngine(a.engines, false) === 'avatar_iv');
+    const all = best.length ? best : everyone;
     const q = (req.query.q || '').toLowerCase().trim();
     const filtered = q ? all.filter(a => a.name.toLowerCase().includes(q)) : all;
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -7759,6 +7878,775 @@ app.get('/api/video-ads/voices', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Could not load voices right now.' });
   }
 });
+
+// ===========================================================================
+// AD MAKER — the upgraded video ads feature
+// 1. Writes 3 short ad scripts from the business's own details (Claude,
+//    ChatGPT as the backup), with honesty checks built in.
+// 2. Puts the business name tag (and logo) on top of every finished video.
+//    HeyGen makes the video; ffmpeg on our server adds the tag afterwards,
+//    and the finished file is stored in our HeyGen asset storage. If ffmpeg
+//    isn't installed on Railway, videos still work, just without the tag.
+// 3. Digital twins: a customer films ~1-2 minutes of themselves, records a
+//    short consent clip on HeyGen's page, and can then present their own ads.
+// ===========================================================================
+const { execFile: adExecFile, spawn: adSpawn } = require('child_process');
+const adFs = require('fs');
+const adOs = require('os');
+const adPath = require('path');
+
+// ---------------------------------------------------------------------------
+// ffmpeg (optional). Railway installs it from the RAILPACK_DEPLOY_APT_PACKAGES
+// variable; FFMPEG_PATH can point somewhere else.
+// ---------------------------------------------------------------------------
+let ffmpegBin = null;
+function checkFfmpeg() {
+  return new Promise((resolve) => {
+    const candidate = process.env.FFMPEG_PATH || 'ffmpeg';
+    adExecFile(candidate, ['-hide_banner', '-version'], { timeout: 15000 }, (err, stdout) => {
+      ffmpegBin = !err && /ffmpeg version/i.test(String(stdout || '')) ? candidate : null;
+      resolve(ffmpegBin);
+    });
+  });
+}
+checkFfmpeg().then((bin) => console.log(bin
+  ? 'Ad Maker: ffmpeg found, business name tags are on.'
+  : 'Ad Maker: ffmpeg not found, videos are delivered without the business name tag.'));
+
+function runFfmpeg(args, ms) {
+  return new Promise((resolve, reject) => {
+    if (!ffmpegBin) return reject(new Error('ffmpeg is not installed'));
+    const p = adSpawn(ffmpegBin, ['-hide_banner', '-nostdin', '-y', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let log = '';
+    p.stderr.on('data', (d) => { log = (log + d).slice(-4000); });
+    const timer = setTimeout(() => { p.kill('SIGKILL'); reject(new Error('ffmpeg took too long')); }, ms);
+    p.on('error', (e) => { clearTimeout(timer); reject(e); });
+    p.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(log);
+      else reject(new Error(`ffmpeg failed (${code}): ${log.split('\n').filter(Boolean).slice(-2).join(' | ')}`));
+    });
+  });
+}
+
+// "ffmpeg -i file" prints the streams and exits with an error (no output
+// file given) — that printout is all we need.
+function probeMedia(file) {
+  return new Promise((resolve) => {
+    if (!ffmpegBin) return resolve(null);
+    adExecFile(ffmpegBin, ['-hide_banner', '-i', file], { timeout: 30000 }, (err, stdout, stderr) => {
+      const s = String(stderr || '');
+      const v = s.match(/Stream #[^\n]*Video: (\w+)[^\n]*?, (\d{2,5})x(\d{2,5})/);
+      const d = s.match(/Duration: (\d+):(\d+):(\d+(?:\.\d+)?)/);
+      resolve({
+        videoCodec: v ? v[1].toLowerCase() : null,
+        width: v ? Number(v[2]) : null,
+        height: v ? Number(v[3]) : null,
+        hasAudio: /Stream #[^\n]*Audio:/.test(s),
+        duration: d ? Number(d[1]) * 3600 + Number(d[2]) * 60 + Number(d[3]) : null,
+      });
+    });
+  });
+}
+
+async function adTempDir() {
+  return adFs.promises.mkdtemp(adPath.join(adOs.tmpdir(), 'rhp-ad-'));
+}
+function adCleanup(dir) {
+  if (dir) adFs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+}
+
+// Streams a URL to a file, refusing anything bigger than maxBytes.
+async function adDownloadToFile(url, file, maxBytes, ms) {
+  const r = await fetch(url, { signal: timeoutSignal(ms) });
+  if (!r.ok) throw new Error(`Download failed (HTTP ${r.status})`);
+  const len = Number(r.headers.get('content-length') || 0);
+  if (len && len > maxBytes) throw new Error('File is too big');
+  const { Readable } = require('stream');
+  const body = r.body && typeof r.body.pipe === 'function' ? r.body : Readable.fromWeb(r.body);
+  await new Promise((resolve, reject) => {
+    let bytes = 0;
+    const out = adFs.createWriteStream(file);
+    body.on('data', (chunk) => {
+      bytes += chunk.length;
+      if (bytes > maxBytes) { body.destroy(); out.destroy(); reject(new Error('File is too big')); }
+    });
+    body.on('error', reject);
+    out.on('error', reject);
+    out.on('finish', resolve);
+    body.pipe(out);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// HeyGen helpers (API v3)
+// ---------------------------------------------------------------------------
+async function heygenJson(method, pathName, body, ms) {
+  const r = await fetch(`https://api.heygen.com${pathName}`, {
+    method,
+    headers: { 'X-Api-Key': process.env.HEYGEN_API_KEY, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: timeoutSignal(ms || 60000),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || (data && data.error)) {
+    const msg = data?.error?.message || data?.message || (typeof data?.error === 'string' ? data.error : null) || `HeyGen returned HTTP ${r.status}`;
+    const e = new Error(msg);
+    e.status = r.status;
+    e.code = data?.error?.code || null;
+    throw e;
+  }
+  return data && data.data !== undefined ? data.data : data;
+}
+
+// Uploads a local file into our HeyGen asset storage (direct upload, up to
+// 200 MB): reserve a spot, send the bytes, then confirm.
+async function heygenUploadFile(file, contentType, filename) {
+  const size = adFs.statSync(file).size;
+  const init = await heygenJson('POST', '/v3/assets/direct-uploads', { filename, content_type: contentType, size_bytes: size });
+  if (!init || !init.upload_url || !init.asset_id) throw new Error('HeyGen did not give us an upload spot.');
+  const headers = { ...(init.upload_headers || {}) };
+  // The size is signed into the upload link, so it must be sent exactly.
+  if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-length')) headers['Content-Length'] = String(size);
+  const put = await fetch(init.upload_url, { method: 'PUT', headers, body: adFs.createReadStream(file), signal: timeoutSignal(15 * 60000) });
+  if (!put.ok) throw new Error(`Upload to HeyGen failed (HTTP ${put.status})`);
+  let done = null;
+  for (let i = 0; i < 6; i++) {
+    try {
+      done = await heygenJson('POST', `/v3/assets/${encodeURIComponent(init.asset_id)}/complete`, {});
+      break;
+    } catch (e) {
+      if (e.status !== 409 || i === 5) throw e; // 409 = the upload hasn't landed yet
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  return { assetId: init.asset_id, url: (done && done.url) || null };
+}
+
+// ---------------------------------------------------------------------------
+// Business name tag
+// The dashboard draws the tag (name + logo in the business's colour) as a
+// PNG, so fonts and logos look right. We only accept a reasonable PNG.
+// ---------------------------------------------------------------------------
+function parseBrandTag(dataUrl) {
+  if (typeof dataUrl !== 'string' || dataUrl.length > 900000) return null;
+  const m = dataUrl.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return null;
+  const buf = Buffer.from(m[1], 'base64');
+  if (buf.length < 100 || buf.length > 600 * 1024) return null;
+  if (buf.slice(0, 8).toString('hex') !== '89504e470d0a1a0a') return null;
+  const w = buf.readUInt32BE(16);
+  const h = buf.readUInt32BE(20);
+  if (!w || !h || w > 2400 || h > 400 || w < h) return null;
+  return dataUrl;
+}
+
+// Where the tag goes and how tall it is, for any video size. Phone and
+// square videos get a TV-style name bar at chest height (left side), which
+// stays clear of the presenter's face, the burned-in captions near the
+// bottom, and the buttons TikTok and Reels put along the top and bottom.
+// Wide videos have room beside the presenter, so the tag sits top-left.
+function nameTagPlacement(W, H) {
+  const tall = H > W * 1.3;
+  const wide = W > H * 1.3;
+  let tagH = Math.round(Math.min(W, H) * (tall ? 0.085 : wide ? 0.075 : 0.07));
+  tagH = Math.max(40, tagH - (tagH % 2));
+  return {
+    tagH,
+    x: Math.round(W * (tall ? 0.05 : wide ? 0.03 : 0.04)),
+    y: Math.round(H * (wide ? 0.06 : 0.62)),
+  };
+}
+
+const brandingQueue = [];
+const brandingActive = new Set();
+let brandingRunning = false;
+function queueBranding(id) {
+  if (brandingActive.has(id) || brandingQueue.includes(id)) return;
+  brandingQueue.push(id);
+  drainBranding();
+}
+async function drainBranding() {
+  if (brandingRunning) return;
+  brandingRunning = true;
+  try {
+    while (brandingQueue.length) {
+      const id = brandingQueue.shift();
+      brandingActive.add(id);
+      try { await brandVideoAd(id); } catch (e) { console.error(`branding video ${id}:`, e.message); }
+      finally { brandingActive.delete(id); }
+    }
+  } finally {
+    brandingRunning = false;
+  }
+}
+
+// Adds the name tag to one finished video. Whatever happens, the customer
+// gets their video: if any step fails, the untouched HeyGen file is used.
+async function brandVideoAd(id) {
+  const r = await pool.query(`SELECT id, source_video_url, brand_tag FROM video_ads WHERE id = $1 AND status = 'branding'`, [id]);
+  const ad = r.rows[0];
+  if (!ad) return;
+  let finalUrl = ad.source_video_url;
+  let branded = false;
+  let dir = null;
+  try {
+    const tagData = parseBrandTag(ad.brand_tag);
+    if (!tagData || !ffmpegBin || !ad.source_video_url) throw new Error('nothing to brand');
+    dir = await adTempDir();
+    const src = adPath.join(dir, 'source.mp4');
+    const tag = adPath.join(dir, 'tag.png');
+    const out = adPath.join(dir, 'branded.mp4');
+    await adDownloadToFile(ad.source_video_url, src, 300 * 1024 * 1024, 5 * 60000);
+    adFs.writeFileSync(tag, Buffer.from(tagData.split(',')[1], 'base64'));
+    const info = await probeMedia(src);
+    if (!info || !info.width || !info.height) throw new Error('could not read the video');
+    const { tagH, x, y } = nameTagPlacement(info.width, info.height);
+    await runFfmpeg([
+      '-i', src, '-i', tag,
+      '-filter_complex', `[1:v]scale=-2:${tagH}[tag];[0:v][tag]overlay=${x}:${y}:format=auto[v]`,
+      '-map', '[v]', '-map', '0:a?',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-pix_fmt', 'yuv420p',
+      '-c:a', 'copy', '-movflags', '+faststart',
+      out,
+    ], 10 * 60000);
+    const up = await heygenUploadFile(out, 'video/mp4', `rankhighpro-ad-${id}.mp4`);
+    if (up.url) { finalUrl = up.url; branded = true; }
+  } catch (e) {
+    if (e.message !== 'nothing to brand') console.error(`name tag for video ${id} skipped:`, e.message);
+  } finally {
+    adCleanup(dir);
+  }
+  await pool.query(
+    `UPDATE video_ads SET status = 'completed', video_url = $1, branded = $2, brand_tag = NULL, completed_at = now()
+     WHERE id = $3 AND status = 'branding'`,
+    [finalUrl, branded, id]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Honesty checks for scripts
+// ---------------------------------------------------------------------------
+function adEscapeRe(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// A line where the presenter pretends to be a customer. Returns the
+// offending words, or null.
+function adScriptTestimonialIssue(text, businessName) {
+  const biz = businessName ? `|${adEscapeRe(businessName)}` : '';
+  const patterns = [
+    new RegExp(`\\bI\\s+(?:hired|called|booked|tried|found|chose|used|picked)\\s+(?:them|this company|this business|these guys|this team${biz})\\b`, 'i'),
+    new RegExp(`\\bI(?:'ve| have)\\s+(?:used|hired|been using|tried)\\s+(?:them|this company|this business|these guys${biz})\\b`, 'i'),
+    /\bthey\s+(?:cleaned|fixed|repaired|did|handled|transformed|saved|treated|helped|painted|serviced|installed|detailed|groomed)\s+(?:my|me)\b/i,
+    /\bI(?:'m|\s+am|'ve\s+been|\s+have\s+been)\s+an?\s+(?:happy\s+|satisfied\s+|loyal\s+|repeat\s+|long[- ]?time\s+|regular\s+)?(?:customer|client)\b/i,
+    /\bas\s+an?\s+(?:happy|satisfied|loyal|repeat|long[- ]?time|regular)\s+(?:customer|client),?\s+I\b/i,
+    /\bI(?:'ll|\s+will)\s+never\s+(?:use|call|hire|go\s+to)\s+anyone\s+else\b/i,
+    new RegExp(`\\b(?:highly|totally|definitely|100%)\\s+recommend\\s+(?:them|this company|this business|these guys${biz})\\b`, 'i'),
+    /\bmy\s+experience\s+with\s+(?:them|this company|this business)\b/i,
+    /\b(?:5|five)[- ]stars?\s+from\s+me\b/i,
+    /\bbest\s+(?:decision|choice)\s+I(?:'ve|\s+have)?\s+(?:ever\s+)?made\b/i,
+  ];
+  for (const p of patterns) {
+    const m = String(text || '').match(p);
+    if (m) return m[0];
+  }
+  return null;
+}
+
+// Claims a business has to be able to back up. Allowed only when the owner
+// typed them in their offer (or, for "#1", they really rank first).
+function adScriptClaimIssue(text, offer, rankedFirst) {
+  const o = String(offer || '').toLowerCase();
+  const checks = [
+    { re: /#\s?1\b|\bnumber[- ]one\b|\bno\.\s?1\b/i, ok: () => rankedFirst || /#\s?1|number[- ]one|no\.\s?1/.test(o) },
+    { re: /\btop[- ]rated\b/i, ok: () => o.includes('top rated') || o.includes('top-rated') },
+    { re: /\bguarantee/i, ok: () => o.includes('guarantee') },
+    { re: /\bbest\s+in\s+(?:town|the\s+area|the\s+city|the\s+county|[A-Z][a-z]+)/, ok: () => o.includes('best') },
+    { re: /\b(?:the|our)\s+best\s+(?:\w+\s+)?(?:company|service|cleaners?|team|business|choice|plumbers?|roofers?|movers?|crew|pros?|option)\b/i, ok: () => o.includes('best') },
+    { re: /\bcheapest\b|\blowest\s+prices?\b/i, ok: () => o.includes('cheap') || o.includes('lowest') },
+  ];
+  for (const c of checks) {
+    const m = String(text || '').match(c.re);
+    if (m && !c.ok()) return m[0];
+  }
+  // Prices and discounts only if the owner gave them.
+  const money = String(text || '').match(/\$\s?\d[\d,]*(?:\.\d+)?|\b\d{1,3}\s?(?:%|percent)\s+off\b/gi) || [];
+  const offerNumbers = o.replace(/,/g, '').replace(/[^\d.]/g, ' ').split(/\s+/).map((t) => t.replace(/\.+$/, '')).filter(Boolean);
+  for (const amount of money) {
+    const digits = amount.replace(/[^\d.]/g, '').replace(/\.+$/, '');
+    if (!digits || !offerNumbers.includes(digits)) return amount;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/ad-maker/scripts   (auth required)
+// Body: { trackedListingId?, goal, offer? }
+// Returns 3 ready-to-read scripts built from the business's own details.
+// ---------------------------------------------------------------------------
+const AD_GOALS = {
+  calls: { label: 'Call now', brief: 'Get more people to call this week. Friendly, a little urgent, no pressure.' },
+  offer: { label: 'Special offer', brief: 'Promote the special offer the owner typed below. Use the offer exactly as written.' },
+  service: { label: 'New service', brief: 'Announce or spotlight the service the owner typed below.' },
+  commercial: { label: 'Commercial', brief: 'Win business customers: offices, clinics, churches, property managers and similar. Stress reliability, scheduling around their hours, and professionalism.' },
+  tip: { label: 'Local tip', brief: 'Share one genuinely useful, specific tip a local customer would value, then a soft invitation to call. No hard sell.' },
+};
+const adScriptUsage = new Map(); // customerId -> { day, count }
+const AD_SCRIPTS_PER_DAY = 25;
+
+function parseAdScripts(reply) {
+  const text = String(reply || '');
+  let list = [];
+  try {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      list = (parsed.scripts || []).map((s) => ({ style: String(s.style || s.label || '').slice(0, 40), text: String(s.text || s.script || '') }));
+    }
+  } catch (e) {
+    // Not valid JSON (e.g. a raw line break inside a script): pull the
+    // "text" values out directly.
+    list = [];
+    const re = /"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = re.exec(text))) list.push({ style: '', text: m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"') });
+  }
+  if (!list.length) {
+    list = text.split(/\n\s*-{3,}\s*\n/).map((t) => ({ style: '', text: t }));
+  }
+  return list
+    .map((s) => ({
+      style: cleanAiReply(s.style).replace(/[":]/g, '').trim(),
+      text: cleanAiReply(s.text).replace(/^\s*(?:script\s*\d*|option\s*\d*)\s*[:.-]\s*/i, '').replace(/\[[^\]]*\]|\([^)]*(?:pause|beat|smile|music|cut)[^)]*\)/gi, '').replace(/\s+/g, ' ').trim(),
+    }))
+    .filter((s) => s.text);
+}
+
+app.post('/api/ad-maker/scripts', requireAuth, async (req, res) => {
+  try {
+    const { plan, status } = await getCustomerPlanStatus(req.customer.id);
+    if (status !== 'active') return res.status(403).json({ error: 'Your RankHighPro subscription is not active.' });
+    const limits = TIER_LIMITS[plan] || TIER_LIMITS.watch;
+    if (limits.videoAdsPerMonth === 0) return res.status(403).json({ error: 'Video ads are not included in your plan.' });
+
+    const goalKey = String(req.body.goal || '');
+    const goal = AD_GOALS[goalKey];
+    if (!goal) return res.status(400).json({ error: 'Please pick what the ad is for.' });
+    const offer = String(req.body.offer || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if ((goalKey === 'offer' || goalKey === 'service') && !offer) {
+      return res.status(400).json({ error: goalKey === 'offer' ? 'Type your offer first, for example "$50 off your first deep clean".' : 'Type the service you want to spotlight first.' });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const used = adScriptUsage.get(req.customer.id);
+    const count = used && used.day === today ? used.count : 0;
+    if (count >= AD_SCRIPTS_PER_DAY) return res.status(429).json({ error: `That's ${AD_SCRIPTS_PER_DAY} sets of scripts today. Pick one of the scripts above, or try again tomorrow.` });
+
+    const listingId = parseInt(req.body.trackedListingId, 10);
+    const listingR = Number.isInteger(listingId) && listingId > 0
+      ? await pool.query(`SELECT * FROM tracked_listings WHERE id = $1 AND customer_id = $2`, [listingId, req.customer.id])
+      : await pool.query(`SELECT * FROM tracked_listings WHERE customer_id = $1 ORDER BY created_at ASC LIMIT 1`, [req.customer.id]);
+    const listing = listingR.rows[0];
+    if (!listing) return res.status(400).json({ error: 'Add your business on the dashboard first, so the scripts can be about it.' });
+
+    const histR = await pool.query(`SELECT local_pack_position, rating, review_count, raw FROM rank_history WHERE tracked_listing_id = $1 ORDER BY checked_at DESC LIMIT 1`, [listing.id]);
+    const last = histR.rows[0] || {};
+    const gbp = (last.raw && last.raw.gbp) || {};
+    const setupR = await pool.query(`SELECT answers FROM managed_setup WHERE customer_id = $1`, [req.customer.id]);
+    const a = (setupR.rows[0] && setupR.rows[0].answers) || {};
+    const rankedFirst = last.local_pack_position === 1;
+    const phone = a.bestPhone || gbp.phone || '';
+    const website = listing.website_url || gbp.website || '';
+    const rating = last.rating != null ? Number(last.rating) : (gbp.rating != null ? Number(gbp.rating) : null);
+    const reviews = last.review_count != null ? Number(last.review_count) : (gbp.reviewCount != null ? Number(gbp.reviewCount) : null);
+    const categories = (gbp.details && Array.isArray(gbp.details.categories)) ? gbp.details.categories.slice(0, 4).join(', ') : '';
+
+    const facts = [
+      `Business name: ${listing.business_name}`,
+      `City / area: ${listing.location}${a.serviceArea ? ` (also serves: ${a.serviceArea})` : ''}`,
+      `What they do: ${a.services || categories || listing.business_category || listing.keyword}`,
+      `Search they want to win on Google: ${listing.keyword}`,
+      phone ? `Phone: ${phone}` : 'Phone: not given (use the website or "search us on Google" instead)',
+      website ? `Website: ${website}` : '',
+      rating && reviews >= 5 ? `Google rating: ${rating} stars from ${reviews} reviews (true, may be mentioned)` : '',
+      rankedFirst ? 'They currently rank #1 on Google Maps for their main search (true, may be mentioned)' : '',
+      a.idealCustomers ? `Customers they want more of: ${a.idealCustomers}` : '',
+      a.hours ? `Hours: ${a.hours}` : '',
+      a.avoid ? `Never say or mention: ${a.avoid}` : '',
+    ].filter(Boolean).join('\n');
+
+    const system = 'You write short video ad scripts for local businesses. A presenter reads the script to camera in a 15 to 30 second social media video (Facebook, Instagram Reels, TikTok). You only use facts you are given.';
+    const ask = (n, avoidList) => `Business facts:
+${facts}
+
+Goal of this ad: ${goal.brief}
+${offer ? `The owner's offer / details, use exactly as written: "${offer}"` : ''}
+
+Write ${n} different scripts. Rules:
+- Each script is 40 to 75 words (15 to 30 seconds spoken).
+- Shape: a hook in the first line that speaks to a local customer (mention the city), the problem, how this business solves it, then a clear call to action that says the business name and the phone number (or website if there is no phone).
+- The presenter speaks FOR the business ("we", "our team", "At ${listing.business_name}, we..."). Never as a customer. No testimonials, no made-up customer stories, no "I hired them", no invented reviews.
+- Only use facts given above. Never say #1, number one, best, top-rated, guaranteed, cheapest, prices or discounts unless they appear in the facts or the owner's offer.
+- Never name competitors.
+- Plain words to be spoken: no emojis, hashtags, brackets, stage directions or labels. Write the phone number the way it should be read.
+- Make the ${n} scripts clearly different from each other in angle and opening line.${avoidList ? `\n- Do not reuse these openings: ${avoidList}` : ''}
+
+Reply with JSON only, exactly like: {"scripts":[{"style":"two or three word angle","text":"the script"}]}`;
+
+    const writeOnce = async (n, avoidList) => {
+      let lastErr = null;
+      for (const key of ['claude', 'chatgpt']) {
+        const out = await runAiProviderSafely(key, system, [], ask(n, avoidList));
+        if (out && out.reply) return parseAdScripts(out.reply);
+        lastErr = out && out.error;
+      }
+      throw new Error(lastErr || 'The script writer is not available right now.');
+    };
+
+    const keep = [];
+    const check = (s) => {
+      const words = s.text.split(/\s+/).filter(Boolean).length;
+      if (words < 25 || words > 95 || s.text.length > 700) return false;
+      if (adScriptTestimonialIssue(s.text, listing.business_name)) return false;
+      if (adScriptClaimIssue(s.text, offer, rankedFirst)) return false;
+      if (keep.some((k) => k.text.slice(0, 40).toLowerCase() === s.text.slice(0, 40).toLowerCase())) return false;
+      return true;
+    };
+    (await writeOnce(3)).forEach((s) => { if (keep.length < 3 && check(s)) keep.push(s); });
+    if (keep.length < 3) {
+      // One more try for whatever failed the checks.
+      const more = await writeOnce(3 - keep.length, keep.map((k) => `"${k.text.split(/[.!?]/)[0]}"`).join(', ')).catch(() => []);
+      more.forEach((s) => { if (keep.length < 3 && check(s)) keep.push(s); });
+    }
+    if (!keep.length) return res.status(502).json({ error: 'The script writer had trouble this time. Please tap Write again.' });
+
+    adScriptUsage.set(req.customer.id, { day: today, count: count + 1 });
+    res.json({
+      scripts: keep.map((s) => {
+        const words = s.text.split(/\s+/).filter(Boolean).length;
+        return { style: s.style || goal.label, text: s.text, words, seconds: Math.max(5, Math.round(words / 2.5)) };
+      }),
+    });
+  } catch (err) {
+    console.error('ad-maker scripts error:', err.message);
+    res.status(500).json({ error: 'Could not write scripts right now. Please try again.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /api/ad-maker/brand   (auth required)
+// Body: { trackedListingId, color?, logo? (data URL, or "" to remove) }
+// Saves the name tag colour and logo for one business.
+// ---------------------------------------------------------------------------
+app.put('/api/ad-maker/brand', requireAuth, async (req, res) => {
+  try {
+    const listingId = parseInt(req.body.trackedListingId, 10);
+    const own = await pool.query(`SELECT id FROM tracked_listings WHERE id = $1 AND customer_id = $2`, [listingId, req.customer.id]);
+    if (!own.rows.length) return res.status(404).json({ error: 'Business not found.' });
+    if (req.body.color !== undefined) {
+      const color = String(req.body.color || '').trim();
+      if (color && !/^#[0-9a-fA-F]{6}$/.test(color)) return res.status(400).json({ error: 'That colour is not valid.' });
+      await pool.query(`UPDATE tracked_listings SET ad_brand_color = $1 WHERE id = $2`, [color || null, listingId]);
+    }
+    if (req.body.logo !== undefined) {
+      const logo = String(req.body.logo || '');
+      if (logo) {
+        const m = logo.match(/^data:image\/(png|jpeg);base64,([A-Za-z0-9+/=]+)$/);
+        if (!m || Buffer.from(m[2], 'base64').length > 250 * 1024) return res.status(400).json({ error: 'Please use a PNG or JPG logo under 250 KB.' });
+      }
+      await pool.query(`UPDATE tracked_listings SET ad_logo = $1 WHERE id = $2`, [logo || null, listingId]);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error('ad-maker brand error:', err.message);
+    res.status(500).json({ error: 'Could not save that right now.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DIGITAL TWINS
+// status: uploading -> training -> needs_consent -> ready (or failed)
+// Only the account owner can make their twin (never from team view), and
+// HeyGen requires the person to record their own consent on camera.
+// ---------------------------------------------------------------------------
+const TWIN_MAX_BYTES = 200 * 1024 * 1024; // HeyGen's direct upload limit
+const TWIN_ATTEMPTS_PER_30_DAYS = 3;
+
+function publicTwin(row) {
+  if (!row) return null;
+  const attemptsUsed = row.attempts_reset_at && (Date.now() - new Date(row.attempts_reset_at).getTime()) > 30 * 86400000 ? 0 : (row.attempts || 0);
+  return {
+    status: row.status,
+    previewImageUrl: row.preview_image_url || null,
+    hasOwnVoice: !!row.voice_id,
+    error: row.error || null,
+    consentUrl: row.status === 'needs_consent' ? (row.consent_url || null) : null,
+    attemptsLeft: Math.max(0, TWIN_ATTEMPTS_PER_30_DAYS - attemptsUsed),
+    updatedAt: row.updated_at,
+  };
+}
+
+// Checks HeyGen for training and consent progress and saves the result.
+async function refreshTwin(row) {
+  if (!row || !row.group_id || !row.look_id || !['training', 'needs_consent'].includes(row.status)) return row;
+  const [look, group] = await Promise.all([
+    heygenJson('GET', `/v3/avatars/looks/${encodeURIComponent(row.look_id)}`),
+    heygenJson('GET', `/v3/avatars/${encodeURIComponent(row.group_id)}`),
+  ]);
+  const lookStatus = look && look.status;
+  const consent = group && group.consent_status;
+  let status = row.status;
+  let error = null;
+  if (lookStatus === 'failed') {
+    status = 'failed';
+    error = (look.error && look.error.message) || 'The studio could not build a twin from that video. Please try a new video.';
+  } else if (lookStatus === 'processing') {
+    status = 'training';
+  } else if (consent === 'rejected') {
+    status = 'needs_consent';
+    error = (group.error && group.error.message) || 'Your OK recording was not accepted. Please record it again.';
+  } else if (lookStatus === 'completed' && (consent === 'accepted' || consent == null)) {
+    status = 'ready';
+  } else {
+    status = 'needs_consent';
+  }
+
+  // A fresh consent link when one is needed (they last 24 hours).
+  let consentUrl = row.consent_url;
+  let consentAt = row.consent_url_at;
+  const linkOld = !consentAt || Date.now() - new Date(consentAt).getTime() > 20 * 3600000;
+  if (status === 'needs_consent' && (linkOld || (consent === 'rejected' && row.consent_status !== 'rejected'))) {
+    const reroute = `${FRONTEND_URL}/dashboard.html?twin=done#videoAdCard`;
+    try {
+      let c;
+      try { c = await heygenJson('POST', `/v3/avatars/${encodeURIComponent(row.group_id)}/consent`, { reroute_url: reroute }); }
+      catch (e) { c = await heygenJson('POST', `/v3/avatars/${encodeURIComponent(row.group_id)}/consent`, {}); }
+      if (c && c.url) { consentUrl = c.url; consentAt = new Date(); }
+    } catch (e) {
+      console.error(`twin consent link for customer ${row.customer_id}:`, e.message);
+    }
+  }
+
+  const engines = Array.isArray(look && look.supported_api_engines) ? look.supported_api_engines.join(',') : row.engines;
+  const voiceId = (look && look.default_voice_id) || (group && group.default_voice_id) || row.voice_id || null;
+  const upd = await pool.query(
+    `UPDATE video_twins SET status = $2, error = $3, consent_status = $4, consent_url = $5, consent_url_at = $6,
+       engines = $7, voice_id = $8, preview_image_url = COALESCE($9, preview_image_url), checked_at = now(),
+       updated_at = CASE WHEN status <> $2 THEN now() ELSE updated_at END
+     WHERE customer_id = $1 AND look_id = $10 RETURNING *`,
+    [row.customer_id, status, error, consent || null, consentUrl || null, consentAt || null, engines || null, voiceId,
+     (look && look.preview_image_url) || null, row.look_id]
+  );
+  return upd.rows[0] || row;
+}
+
+// Background step after the footage arrives: tidy the file if needed, send
+// it to HeyGen, and start the twin.
+async function processTwinUpload(customerId, file, dir) {
+  try {
+    const fd = adFs.openSync(file, 'r');
+    const head = Buffer.alloc(16);
+    adFs.readSync(fd, head, 0, 16, 0);
+    adFs.closeSync(fd);
+    const isMp4Box = head.slice(4, 8).toString('latin1') === 'ftyp';
+    const brand = head.slice(8, 12).toString('latin1');
+    const isQuickTime = isMp4Box && brand === 'qt  ';
+    const isWebm = head.slice(0, 4).toString('hex') === '1a45dfa3';
+
+    let uploadFile = file;
+    let contentType = isWebm ? 'video/webm' : 'video/mp4';
+    if (ffmpegBin) {
+      const info = await probeMedia(file);
+      if (!info || !info.videoCodec) throw Object.assign(new Error('We could not read that video. Please record it again with your phone\'s camera app.'), { friendly: true });
+      if (info.duration && info.duration < 15) throw Object.assign(new Error('That video is shorter than 15 seconds. Please record 1 to 2 minutes of yourself talking.'), { friendly: true });
+      if (info.duration && info.duration > 600) throw Object.assign(new Error('That video is longer than 10 minutes. Please record 1 to 2 minutes of yourself talking.'), { friendly: true });
+      // iPhones save .mov files and newer phones often use HEVC; HeyGen
+      // wants MP4 (or WebM), so convert those. Plain MP4 + H.264 goes as is.
+      if (!(isMp4Box && !isQuickTime && info.videoCodec === 'h264') && !(isWebm && /vp8|vp9/.test(info.videoCodec))) {
+        const out = adPath.join(dir, 'twin.mp4');
+        const videoArgs = info.videoCodec === 'h264'
+          ? ['-c:v', 'copy']
+          : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+             '-vf', "scale='if(gt(iw,ih),min(1920,iw),-2)':'if(gt(iw,ih),-2,min(1920,ih))'"];
+        await runFfmpeg(['-i', file, '-map', '0:v:0', '-map', '0:a:0?', ...videoArgs, '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out], 15 * 60000);
+        uploadFile = out;
+        contentType = 'video/mp4';
+      }
+    } else if (!isMp4Box && !isWebm) {
+      throw Object.assign(new Error('Please upload an MP4 video from your phone\'s camera app.'), { friendly: true });
+    }
+    if (adFs.statSync(uploadFile).size > TWIN_MAX_BYTES) {
+      throw Object.assign(new Error('That video is too big. Please record about 1 minute instead.'), { friendly: true });
+    }
+
+    const up = await heygenUploadFile(uploadFile, contentType, contentType === 'video/webm' ? 'twin-footage.webm' : 'twin-footage.mp4');
+    const created = await heygenJson('POST', '/v3/avatars', {
+      type: 'digital_twin',
+      name: `RankHighPro customer ${customerId}`,
+      file: { type: 'asset_id', asset_id: up.assetId },
+    }, 120000);
+    const item = (created && created.avatar_item) || {};
+    const group = (created && created.avatar_group) || {};
+    const groupId = item.group_id || group.id;
+    const lookId = item.id;
+    if (!groupId || !lookId) throw new Error('HeyGen did not return the new twin.');
+
+    const prev = (await pool.query(`SELECT group_id FROM video_twins WHERE customer_id = $1`, [customerId])).rows[0];
+    await pool.query(
+      `UPDATE video_twins SET status = 'training', group_id = $2, look_id = $3, voice_id = $4, engines = $5,
+         preview_image_url = $6, consent_status = $7, consent_url = NULL, consent_url_at = NULL, error = NULL,
+         checked_at = now(), updated_at = now()
+       WHERE customer_id = $1`,
+      [customerId, groupId, lookId, item.default_voice_id || group.default_voice_id || null,
+       Array.isArray(item.supported_api_engines) ? item.supported_api_engines.join(',') : null,
+       item.preview_image_url || group.preview_image_url || null, group.consent_status || null]
+    );
+    // Remove the old twin from HeyGen once the new one exists.
+    if (prev && prev.group_id && prev.group_id !== groupId) {
+      heygenJson('DELETE', `/v3/avatars/${encodeURIComponent(prev.group_id)}`).catch((e) => console.error('old twin delete:', e.message));
+    }
+  } catch (err) {
+    console.error(`twin upload for customer ${customerId}:`, err.message);
+    const msg = err.friendly ? err.message : `The studio could not take that video (${String(err.message).slice(0, 160)}). Please try again.`;
+    // A video we turned away ourselves (too short, too long, unreadable)
+    // never reached HeyGen, so it doesn't use up one of their tries.
+    await pool.query(
+      `UPDATE video_twins SET status = 'failed', error = $2, updated_at = now(),
+         attempts = CASE WHEN $3::boolean THEN GREATEST(attempts - 1, 0) ELSE attempts END
+       WHERE customer_id = $1`,
+      [customerId, msg, !!err.friendly]
+    ).catch(() => {});
+  } finally {
+    adCleanup(dir);
+  }
+}
+
+// GET /api/ad-maker/twin — this customer's twin and whether they can make one.
+app.get('/api/ad-maker/twin', requireAuth, async (req, res) => {
+  try {
+    let row = (await pool.query(`SELECT * FROM video_twins WHERE customer_id = $1`, [req.customer.id])).rows[0];
+    // Uploads that never finished (server restarted mid-way) are marked failed.
+    if (row && row.status === 'uploading' && Date.now() - new Date(row.updated_at).getTime() > 45 * 60000) {
+      row = (await pool.query(`UPDATE video_twins SET status = 'failed', error = 'That upload did not finish. Please try again.', updated_at = now() WHERE customer_id = $1 RETURNING *`, [req.customer.id])).rows[0];
+    }
+    if (row && process.env.HEYGEN_API_KEY && ['training', 'needs_consent'].includes(row.status) &&
+        (!row.checked_at || Date.now() - new Date(row.checked_at).getTime() > 15000)) {
+      row = await refreshTwin(row).catch((e) => { console.error('twin refresh:', e.message); return row; });
+    }
+    res.json({ twin: publicTwin(row), canCreate: !req.customer.team && !!process.env.HEYGEN_API_KEY, teamView: !!req.customer.team });
+  } catch (err) {
+    console.error('ad-maker twin get error:', err.message);
+    res.status(500).json({ error: 'Could not load your twin right now.' });
+  }
+});
+
+// POST /api/ad-maker/twin/upload — the raw video file is the request body.
+app.post('/api/ad-maker/twin/upload', requireAuth, async (req, res) => {
+  let dir = null;
+  try {
+    if (req.customer.team) return res.status(403).json({ error: 'Only the account owner can make their own twin. They need to do this from their own login.' });
+    if (!process.env.HEYGEN_API_KEY) return res.status(500).json({ error: 'Video ads are not set up on the server.' });
+    const { plan, status } = await getCustomerPlanStatus(req.customer.id);
+    const limits = TIER_LIMITS[plan] || TIER_LIMITS.watch;
+    if (status !== 'active' || limits.videoAdsPerMonth === 0) return res.status(403).json({ error: 'Digital twins come with video ads on an active plan.' });
+
+    const len = Number(req.headers['content-length'] || 0);
+    if (len > TWIN_MAX_BYTES) return res.status(413).json({ error: 'That video is too big (over 200 MB). Please record about 1 minute instead.' });
+    const ctype = String(req.headers['content-type'] || '').toLowerCase();
+    if (!/^video\//.test(ctype) && ctype !== 'application/octet-stream') return res.status(400).json({ error: 'Please choose a video file.' });
+
+    const existing = (await pool.query(`SELECT * FROM video_twins WHERE customer_id = $1`, [req.customer.id])).rows[0];
+    if (existing && existing.status === 'uploading' && Date.now() - new Date(existing.updated_at).getTime() < 45 * 60000) {
+      return res.status(409).json({ error: 'Your last video is still being sent to the studio. Give it a few minutes.' });
+    }
+    if (existing && ['training'].includes(existing.status)) {
+      return res.status(409).json({ error: 'Your twin is still being built. Give it a few minutes.' });
+    }
+    const windowFresh = existing && (Date.now() - new Date(existing.attempts_reset_at).getTime()) <= 30 * 86400000;
+    if (existing && windowFresh && existing.attempts >= TWIN_ATTEMPTS_PER_30_DAYS) {
+      return res.status(429).json({ error: `You can make a new twin ${TWIN_ATTEMPTS_PER_30_DAYS} times every 30 days. Please message our team if you need help.` });
+    }
+
+    dir = await adTempDir();
+    const file = adPath.join(dir, 'upload.bin');
+    const bytes = await new Promise((resolve, reject) => {
+      let n = 0;
+      let failed = false;
+      const out = adFs.createWriteStream(file);
+      const fail = (e) => { if (failed) return; failed = true; out.destroy(); reject(e); };
+      req.on('data', (chunk) => {
+        n += chunk.length;
+        if (n > TWIN_MAX_BYTES) { fail(Object.assign(new Error('too big'), { tooBig: true })); req.unpipe && req.unpipe(out); }
+      });
+      req.on('error', fail);
+      req.on('aborted', () => fail(new Error('aborted')));
+      out.on('error', fail);
+      out.on('finish', () => { if (!failed) resolve(n); });
+      req.pipe(out);
+    });
+    if (bytes < 100 * 1024) {
+      adCleanup(dir);
+      return res.status(400).json({ error: 'That video is too short. Please record 1 to 2 minutes of yourself talking.' });
+    }
+
+    const row = (await pool.query(
+      `INSERT INTO video_twins (customer_id, status, attempts, attempts_reset_at, updated_at)
+       VALUES ($1, 'uploading', 1, now(), now())
+       ON CONFLICT (customer_id) DO UPDATE SET
+         status = 'uploading', error = NULL, updated_at = now(),
+         attempts = CASE WHEN video_twins.attempts_reset_at < now() - interval '30 days' THEN 1 ELSE video_twins.attempts + 1 END,
+         attempts_reset_at = CASE WHEN video_twins.attempts_reset_at < now() - interval '30 days' THEN now() ELSE video_twins.attempts_reset_at END
+       RETURNING *`,
+      [req.customer.id]
+    )).rows[0];
+    res.json({ twin: publicTwin(row) });
+    const workDir = dir;
+    dir = null; // processTwinUpload cleans it up
+    processTwinUpload(req.customer.id, file, workDir);
+  } catch (err) {
+    adCleanup(dir);
+    if (err.tooBig) return res.status(413).json({ error: 'That video is too big (over 200 MB). Please record about 1 minute instead.' });
+    console.error('twin upload error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'The upload did not finish. Please check your connection and try again.' });
+  }
+});
+
+// DELETE /api/ad-maker/twin — removes the twin here and at HeyGen.
+app.delete('/api/ad-maker/twin', requireAuth, async (req, res) => {
+  try {
+    if (req.customer.team) return res.status(403).json({ error: 'Only the account owner can remove their twin.' });
+    const row = (await pool.query(`SELECT * FROM video_twins WHERE customer_id = $1`, [req.customer.id])).rows[0];
+    if (!row) return res.json({ removed: true });
+    if (row.status === 'uploading') return res.status(409).json({ error: 'Your video is still uploading. Try again in a few minutes.' });
+    if (row.group_id && process.env.HEYGEN_API_KEY) {
+      await heygenJson('DELETE', `/v3/avatars/${encodeURIComponent(row.group_id)}`).catch((e) => console.error('twin delete at HeyGen:', e.message));
+    }
+    await pool.query(`DELETE FROM video_twins WHERE customer_id = $1`, [req.customer.id]);
+    res.json({ removed: true });
+  } catch (err) {
+    console.error('ad-maker twin delete error:', err.message);
+    res.status(500).json({ error: 'Could not remove your twin right now.' });
+  }
+});
+
+// Every minute: keep twins that are training or waiting for consent moving.
+async function pollTwins() {
+  if (!process.env.HEYGEN_API_KEY) return;
+  try {
+    const r = await pool.query(
+      `SELECT * FROM video_twins WHERE status IN ('training', 'needs_consent')
+         AND updated_at > now() - interval '3 days'
+         AND (checked_at IS NULL OR checked_at < now() - interval '50 seconds')
+       ORDER BY checked_at NULLS FIRST LIMIT 20`
+    );
+    for (const row of r.rows) {
+      await refreshTwin(row).catch((e) => console.error(`twin poll ${row.customer_id}:`, e.message));
+    }
+  } catch (err) {
+    console.error('pollTwins error:', err.message);
+  }
+}
+cron.schedule('* * * * *', pollTwins);
 
 // ---------------------------------------------------------------------------
 // GOOGLE BUSINESS PROFILE — connect a customer's Google account (OAuth)
@@ -10322,23 +11210,48 @@ cron.schedule('0 6 * * 2', runWeeklyAiVisibilityChecks);
 async function pollProcessingVideoAds() {
   if (!process.env.HEYGEN_API_KEY) return;
   try {
+    // Name tags that stalled (e.g. the server restarted mid-way): pick them
+    // back up, or after 20 minutes just deliver the untouched video.
+    const branding = await pool.query(
+      `SELECT id, (branding_started_at < now() - interval '20 minutes') AS stale FROM video_ads WHERE status = 'branding'`
+    );
+    for (const row of branding.rows) {
+      if (brandingActive.has(row.id) || brandingQueue.includes(row.id)) continue;
+      if (row.stale) {
+        await pool.query(
+          `UPDATE video_ads SET status = 'completed', video_url = source_video_url, brand_tag = NULL, completed_at = now() WHERE id = $1 AND status = 'branding'`,
+          [row.id]
+        );
+      } else {
+        queueBranding(row.id);
+      }
+    }
+
     const processing = await pool.query(
-      `SELECT id, heygen_video_id FROM video_ads WHERE status = 'processing' AND heygen_video_id IS NOT NULL`
+      `SELECT id, heygen_video_id, (brand_tag IS NOT NULL) AS has_brand FROM video_ads WHERE status = 'processing' AND heygen_video_id IS NOT NULL`
     );
     if (processing.rows.length === 0) return;
 
     for (const row of processing.rows) {
       try {
         const heygenData = await checkHeygenVideoStatus(row.heygen_video_id);
-        if (heygenData.status === 'completed') {
+        if (heygenData.status === 'completed' && row.has_brand && ffmpegBin && heygenData.video_url) {
+          // HeyGen is done; add the business name tag before showing it.
           await pool.query(
-            `UPDATE video_ads SET status = 'completed', video_url = $1, thumbnail_url = $2, completed_at = now() WHERE id = $3`,
+            `UPDATE video_ads SET status = 'branding', source_video_url = $1, video_url = $1, thumbnail_url = $2, branding_started_at = now()
+             WHERE id = $3 AND status = 'processing'`,
+            [heygenData.video_url, heygenData.thumbnail_url || null, row.id]
+          );
+          queueBranding(row.id);
+        } else if (heygenData.status === 'completed') {
+          await pool.query(
+            `UPDATE video_ads SET status = 'completed', video_url = $1, source_video_url = $1, thumbnail_url = $2, brand_tag = NULL, completed_at = now() WHERE id = $3`,
             [heygenData.video_url, heygenData.thumbnail_url || null, row.id]
           );
         } else if (heygenData.status === 'failed') {
           const errMsg = heygenData.error?.message || heygenData.error?.detail || 'Video generation failed on HeyGen.';
           await pool.query(
-            `UPDATE video_ads SET status = 'failed', error = $1, completed_at = now() WHERE id = $2`,
+            `UPDATE video_ads SET status = 'failed', error = $1, brand_tag = NULL, completed_at = now() WHERE id = $2`,
             [errMsg, row.id]
           );
         }
