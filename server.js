@@ -2957,7 +2957,7 @@ const TIER_DISPLAY_NAMES = {
 // ---------------------------------------------------------------------------
 const TIER_LIMITS = {
   watch:       { aiContentPerMonth: 2,    gbpPostsPerMonth: 4,    reviewRequestsPerMonth: null, supportChatPerMonth: 40,  extraKeywordsLimit: 0, videoAdsPerMonth: 1 },
-  grow:        { aiContentPerMonth: 6,    gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: 100, extraKeywordsLimit: 3, videoAdsPerMonth: 3 },
+  grow:        { aiContentPerMonth: 6,    gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: 100, extraKeywordsLimit: 4, videoAdsPerMonth: 3 },
   managed:     { aiContentPerMonth: null, gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: null, extraKeywordsLimit: 5, videoAdsPerMonth: 6 },
   // Fully Managed By Us customers don't touch most self-serve tools
   // directly (the dashboard hides them entirely — see the stripped-down
@@ -7474,8 +7474,8 @@ app.get('/api/schema-check/:listingId', requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/api/ai-visibility', requireAuth, async (req, res) => {
   try {
-    const { trackedListingId } = req.query;
-    if (!trackedListingId) {
+    const trackedListingId = parseInt(req.query.trackedListingId, 10);
+    if (!Number.isInteger(trackedListingId) || trackedListingId <= 0) {
       return res.status(400).json({ error: 'Missing trackedListingId' });
     }
 
@@ -7488,8 +7488,14 @@ app.get('/api/ai-visibility', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Listing not found' });
     }
 
+    // Leave out the "raw" column (the full AI answers): the dashboard never
+    // shows it, and it made this response big and slow to load.
     const result = await pool.query(
-      `SELECT * FROM ai_visibility_checks WHERE tracked_listing_id = $1 ORDER BY checked_at DESC LIMIT 12`,
+      `SELECT id, tracked_listing_id, checked_at, prompt_used,
+              chatgpt_mentioned, perplexity_mentioned, gemini_mentioned,
+              grok_mentioned, claude_mentioned, game_plan, game_plan_generated_at
+         FROM ai_visibility_checks WHERE tracked_listing_id = $1
+        ORDER BY checked_at DESC LIMIT 12`,
       [trackedListingId]
     );
     res.json({ checks: result.rows });
