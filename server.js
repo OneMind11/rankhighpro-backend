@@ -500,6 +500,14 @@ async function initDb() {
       connected_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Which Google listing (accounts/X/locations/Y) each RankHighPro listing
+  // posts to, plus what happened when we posted or replied on Google.
+  await pool.query(`ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS gbp_location_name TEXT;`);
+  await pool.query(`ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS gbp_location_title TEXT;`);
+  await pool.query(`ALTER TABLE gbp_posts ADD COLUMN IF NOT EXISTS google_post_name TEXT;`);
+  await pool.query(`ALTER TABLE gbp_posts ADD COLUMN IF NOT EXISTS posted_to_google_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE review_replies ADD COLUMN IF NOT EXISTS posted_to_google_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE review_replies ADD COLUMN IF NOT EXISTS posted_reply TEXT;`);
   // ---------------------------------------------------------------------
   // SOCIAL ADS (Facebook / Instagram)
   // AI-drafted ad creative: headline, body copy, and a suggested
@@ -8751,10 +8759,21 @@ cron.schedule('* * * * *', pollTwins);
 const GBP_SCOPE = 'https://www.googleapis.com/auth/business.manage';
 const GBP_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'https://rankhighpro-backend-production.up.railway.app/api/gbp/oauth/callback';
 
-function gbpConnectEnabled() {
-  return process.env.GBP_CONNECT_ENABLED === 'true'
-    && !!process.env.GOOGLE_CLIENT_ID
-    && !!process.env.GOOGLE_CLIENT_SECRET;
+// Railway has these saved as GOOGLE_OAUTH_CLIENT_ID / _SECRET; either name works.
+function gbpClientId() { return process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID || ''; }
+function gbpClientSecret() { return process.env.GOOGLE_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET || ''; }
+
+// GBP_TESTER_EMAILS (comma-separated) lets just those logins see and use
+// Connect Google while the Google app is still in "Testing" mode. Everyone
+// else keeps seeing "Coming soon" until GBP_CONNECT_ENABLED=true.
+function gbpTesterEmails() {
+  return String(process.env.GBP_TESTER_EMAILS || '')
+    .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+}
+function gbpConnectEnabled(email) {
+  if (!gbpClientId() || !gbpClientSecret()) return false;
+  if (process.env.GBP_CONNECT_ENABLED === 'true') return true;
+  return !!email && gbpTesterEmails().includes(String(email).toLowerCase());
 }
 
 // Turns a customer's stored refresh token into a short-lived access token.
@@ -8772,8 +8791,8 @@ async function getGbpAccessToken(customerId) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: process.env.GOOGLE_CLIENT_ID,
-      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      client_id: gbpClientId(),
+      client_secret: gbpClientSecret(),
       refresh_token: refreshToken,
       grant_type: 'refresh_token',
     }),
@@ -8793,10 +8812,20 @@ app.get('/api/gbp/status', requireAuth, async (req, res) => {
       'SELECT connected_at FROM gbp_connections WHERE customer_id = $1',
       [req.customer.id]
     );
+    const links = await pool.query(
+      `SELECT id, business_name, gbp_location_name, gbp_location_title FROM tracked_listings WHERE customer_id = $1 ORDER BY id`,
+      [req.customer.id]
+    );
     res.json({
-      enabled: gbpConnectEnabled(),
+      enabled: gbpConnectEnabled(req.customer.email),
       connected: row.rows.length > 0,
       connectedAt: row.rows[0]?.connected_at || null,
+      listings: links.rows.map((l) => ({
+        id: l.id,
+        businessName: l.business_name,
+        linked: !!l.gbp_location_name,
+        googleTitle: l.gbp_location_title || null,
+      })),
     });
   } catch (err) {
     console.error('gbp status error:', err.message);
@@ -8808,7 +8837,7 @@ app.get('/api/gbp/status', requireAuth, async (req, res) => {
 // dashboard to send the customer to. The signed "state" proves, when they
 // come back, which customer started this and that it was within 10 minutes.
 app.post('/api/gbp/oauth/start', requireAuth, (req, res) => {
-  if (!gbpConnectEnabled()) {
+  if (!gbpConnectEnabled(req.customer.email)) {
     return res.status(503).json({ error: 'Google connection is not available yet.' });
   }
   const state = jwt.sign(
@@ -8817,7 +8846,7 @@ app.post('/api/gbp/oauth/start', requireAuth, (req, res) => {
     { expiresIn: '10m' }
   );
   const params = new URLSearchParams({
-    client_id: process.env.GOOGLE_CLIENT_ID,
+    client_id: gbpClientId(),
     redirect_uri: GBP_REDIRECT_URI,
     response_type: 'code',
     scope: GBP_SCOPE,
@@ -8836,7 +8865,6 @@ app.get('/api/gbp/oauth/callback', async (req, res) => {
   const back = (result) => res.redirect(`${FRONTEND_URL}/dashboard.html?gbp=${result}`);
   try {
     if (req.query.error) return back('denied');
-    if (!gbpConnectEnabled()) return back('unavailable');
 
     let payload;
     try {
@@ -8845,6 +8873,8 @@ app.get('/api/gbp/oauth/callback', async (req, res) => {
       return back('expired');
     }
     if (payload.purpose !== 'gbp_oauth' || !payload.cid) return back('error');
+    const who = await pool.query('SELECT email FROM customers WHERE id = $1', [payload.cid]);
+    if (!gbpConnectEnabled(who.rows[0]?.email)) return back('unavailable');
 
     const code = String(req.query.code || '');
     if (!code) return back('error');
@@ -8854,8 +8884,8 @@ app.get('/api/gbp/oauth/callback', async (req, res) => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         code,
-        client_id: process.env.GOOGLE_CLIENT_ID,
-        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        client_id: gbpClientId(),
+        client_secret: gbpClientSecret(),
         redirect_uri: GBP_REDIRECT_URI,
         grant_type: 'authorization_code',
       }),
@@ -8906,11 +8936,304 @@ app.post('/api/gbp/disconnect', requireAuth, async (req, res) => {
         console.error('gbp revoke failed (deleting our copy anyway):', e.message);
       }
       await pool.query('DELETE FROM gbp_connections WHERE customer_id = $1', [req.customer.id]);
+      await pool.query(
+        'UPDATE tracked_listings SET gbp_location_name = NULL, gbp_location_title = NULL WHERE customer_id = $1',
+        [req.customer.id]
+      );
     }
     res.json({ ok: true });
   } catch (err) {
     console.error('gbp disconnect error:', err.message);
     res.status(500).json({ error: 'Could not disconnect right now.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GOOGLE BUSINESS PROFILE — post and reply for real (after API approval)
+// 1. The customer picks which of their Google listings each RankHighPro
+//    listing belongs to (we suggest the match).
+// 2. "Post to Google" publishes an approved post (with its photo).
+// 3. "Post reply to Google" publishes a review reply.
+// Nothing posts on its own: every post and reply needs the customer's tap.
+// ---------------------------------------------------------------------------
+const GBP_V4 = 'https://mybusiness.googleapis.com/v4';
+
+// One Google call with the customer's access token. Returns parsed JSON or
+// throws an Error whose message is safe to show the customer.
+async function gbpGoogleFetch(accessToken, url, opts = {}) {
+  const response = await fetch(url, {
+    method: opts.method || 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (e) { data = {}; }
+  if (!response.ok) {
+    const why = data?.error?.message || `Google returned ${response.status}`;
+    console.error('gbp google call failed:', url.replace(/\?.*$/, ''), response.status, why);
+    const err = new Error(gbpFriendlyError(response.status, why));
+    err.status = response.status;
+    throw err;
+  }
+  return data;
+}
+
+function gbpFriendlyError(status, why) {
+  if (status === 401) return 'Your Google connection expired. Please tap Disconnect, then Connect Google again.';
+  if (status === 403) return 'Google says this account isn\'t allowed to manage that listing. Make sure you connected the Google account that owns or manages it.';
+  if (status === 404) return 'Google couldn\'t find that listing or review any more. Pick your listing again in Step 1B.';
+  if (status === 429) return 'Google is busy right now. Please try again in a minute.';
+  if (/verif/i.test(why)) return 'Google only allows posting on verified listings. Finish verifying your listing on Google first.';
+  return 'Google didn\'t accept that just now. Please try again in a few minutes.';
+}
+
+// Every Google listing the connected account can manage.
+async function gbpListAllLocations(accessToken) {
+  const accounts = await gbpGoogleFetch(accessToken, 'https://mybusinessaccountmanagement.googleapis.com/v1/accounts?pageSize=20');
+  const out = [];
+  for (const account of (accounts.accounts || []).slice(0, 20)) {
+    let pageToken = '';
+    for (let page = 0; page < 5; page++) {
+      const url = `https://mybusinessbusinessinformation.googleapis.com/v1/${account.name}/locations`
+        + `?pageSize=100&readMask=name,title,storefrontAddress,metadata${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+      const data = await gbpGoogleFetch(accessToken, url);
+      for (const loc of (data.locations || [])) {
+        const addr = loc.storefrontAddress;
+        out.push({
+          // v4 posting and reviews need the account in front: accounts/X/locations/Y
+          location: `${account.name}/${loc.name}`,
+          title: loc.title || '',
+          address: addr ? [(addr.addressLines || []).join(' '), addr.locality, addr.administrativeArea].filter(Boolean).join(', ') : 'Service-area business',
+          placeId: loc.metadata?.placeId || null,
+        });
+      }
+      pageToken = data.nextPageToken || '';
+      if (!pageToken) break;
+    }
+  }
+  return out;
+}
+
+function gbpNormalize(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// GET /api/gbp/locations — the customer's Google listings, plus our best
+// guess for which one matches each RankHighPro listing.
+app.get('/api/gbp/locations', requireAuth, async (req, res) => {
+  try {
+    if (!gbpConnectEnabled(req.customer.email)) return res.status(503).json({ error: 'Google connection is not available yet.' });
+    let accessToken;
+    try {
+      accessToken = await getGbpAccessToken(req.customer.id);
+    } catch (e) {
+      return res.status(401).json({ error: 'Your Google connection expired. Please tap Disconnect, then Connect Google again.' });
+    }
+    if (!accessToken) return res.status(400).json({ error: 'Connect Google first.' });
+
+    const locations = await gbpListAllLocations(accessToken);
+    const listings = await pool.query(
+      `SELECT id, business_name, google_place_id, gbp_location_name FROM tracked_listings WHERE customer_id = $1 ORDER BY id`,
+      [req.customer.id]
+    );
+    const suggestions = {};
+    for (const l of listings.rows) {
+      if (l.gbp_location_name) { suggestions[l.id] = l.gbp_location_name; continue; }
+      const byPlace = l.google_place_id && locations.find((g) => g.placeId && g.placeId === l.google_place_id);
+      const byName = locations.find((g) => gbpNormalize(g.title) === gbpNormalize(l.business_name));
+      const match = byPlace || byName || (locations.length === 1 ? locations[0] : null);
+      if (match) suggestions[l.id] = match.location;
+    }
+    res.json({ locations, suggestions });
+  } catch (err) {
+    console.error('gbp locations error:', err.message);
+    res.status(502).json({ error: err.message || 'Could not load your Google listings.' });
+  }
+});
+
+// POST /api/gbp/link/:listingId  Body: { location } — saves which Google
+// listing this RankHighPro listing posts to. Checked against the customer's
+// own Google account so nobody can point at a listing they don't manage.
+app.post('/api/gbp/link/:listingId', requireAuth, async (req, res) => {
+  try {
+    if (!gbpConnectEnabled(req.customer.email)) return res.status(503).json({ error: 'Google connection is not available yet.' });
+    const listing = await pool.query(
+      `SELECT id FROM tracked_listings WHERE id = $1 AND customer_id = $2`,
+      [req.params.listingId, req.customer.id]
+    );
+    if (listing.rows.length === 0) return res.status(404).json({ error: 'Listing not found' });
+
+    const wanted = String(req.body?.location || '');
+    if (!wanted) {
+      await pool.query(`UPDATE tracked_listings SET gbp_location_name = NULL, gbp_location_title = NULL WHERE id = $1`, [listing.rows[0].id]);
+      return res.json({ ok: true, linked: false });
+    }
+    let accessToken;
+    try {
+      accessToken = await getGbpAccessToken(req.customer.id);
+    } catch (e) {
+      return res.status(401).json({ error: 'Your Google connection expired. Please tap Disconnect, then Connect Google again.' });
+    }
+    if (!accessToken) return res.status(400).json({ error: 'Connect Google first.' });
+    const locations = await gbpListAllLocations(accessToken);
+    const match = locations.find((g) => g.location === wanted);
+    if (!match) return res.status(400).json({ error: 'That listing isn\'t on the Google account you connected.' });
+
+    await pool.query(
+      `UPDATE tracked_listings SET gbp_location_name = $1, gbp_location_title = $2 WHERE id = $3`,
+      [match.location, match.title, listing.rows[0].id]
+    );
+    res.json({ ok: true, linked: true, googleTitle: match.title });
+  } catch (err) {
+    console.error('gbp link error:', err.message);
+    res.status(502).json({ error: err.message || 'Could not save that listing.' });
+  }
+});
+
+// Signed address for a post's photo. Google downloads the photo from this
+// address when we publish, so it has to work without a login.
+function gbpImageToken(postId) {
+  return crypto.createHmac('sha256', String(process.env.JWT_SECRET || 'rhp')).update(`gbp-img:${postId}`).digest('hex').slice(0, 32);
+}
+app.get('/api/public/gbp-post-image/:file', async (req, res) => {
+  try {
+    const id = parseInt(String(req.params.file || '').replace(/\.png$/i, ''), 10);
+    const t = String(req.query.t || '');
+    const expected = gbpImageToken(id);
+    if (!id || t.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(t), Buffer.from(expected))) {
+      return res.status(404).end();
+    }
+    const row = await pool.query(`SELECT image_base64 FROM gbp_posts WHERE id = $1`, [id]);
+    if (!row.rows[0]?.image_base64) return res.status(404).end();
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(row.rows[0].image_base64, 'base64'));
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+
+// POST /api/gbp-posts/:id/publish — puts an approved post live on Google.
+app.post('/api/gbp-posts/:id/publish', requireAuth, async (req, res) => {
+  try {
+    if (!gbpConnectEnabled(req.customer.email)) return res.status(503).json({ error: 'Google posting is not available yet.' });
+    const found = await pool.query(
+      `SELECT p.*, tl.gbp_location_name FROM gbp_posts p
+         JOIN tracked_listings tl ON tl.id = p.tracked_listing_id
+        WHERE p.id = $1 AND tl.customer_id = $2`,
+      [req.params.id, req.customer.id]
+    );
+    const post = found.rows[0];
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (post.posted_to_google_at) return res.status(409).json({ error: 'This post is already live on Google.' });
+    if (post.status !== 'approved') return res.status(400).json({ error: 'Approve the post first.' });
+    if (!post.gbp_location_name) return res.status(400).json({ error: 'Pick which Google listing to post to in Step 1B first.' });
+
+    let accessToken;
+    try {
+      accessToken = await getGbpAccessToken(req.customer.id);
+    } catch (e) {
+      return res.status(401).json({ error: 'Your Google connection expired. Please tap Disconnect, then Connect Google again.' });
+    }
+    if (!accessToken) return res.status(400).json({ error: 'Connect Google first in Step 1B.' });
+
+    // Claim the post first so a double tap can't publish it twice.
+    const claim = await pool.query(
+      `UPDATE gbp_posts SET posted_to_google_at = now() WHERE id = $1 AND posted_to_google_at IS NULL RETURNING id`,
+      [post.id]
+    );
+    if (claim.rows.length === 0) return res.status(409).json({ error: 'This post is already being posted.' });
+
+    const body = {
+      languageCode: 'en-US',
+      summary: String(post.content || '').slice(0, 1500),
+      topicType: 'STANDARD',
+    };
+    if (post.image_base64) {
+      body.media = [{
+        mediaFormat: 'PHOTO',
+        sourceUrl: `${BACKEND_URL}/api/public/gbp-post-image/${post.id}.png?t=${gbpImageToken(post.id)}`,
+      }];
+    }
+    try {
+      const created = await gbpGoogleFetch(accessToken, `${GBP_V4}/${post.gbp_location_name}/localPosts`, { method: 'POST', body });
+      const saved = await pool.query(
+        `UPDATE gbp_posts SET status = 'posted', google_post_name = $1 WHERE id = $2 RETURNING *`,
+        [created.name || null, post.id]
+      );
+      return res.json({ post: saved.rows[0] });
+    } catch (googleErr) {
+      await pool.query(`UPDATE gbp_posts SET posted_to_google_at = NULL WHERE id = $1`, [post.id]);
+      return res.status(502).json({ error: googleErr.message });
+    }
+  } catch (err) {
+    console.error('gbp publish error:', err.message);
+    res.status(500).json({ error: 'Could not post to Google right now.' });
+  }
+});
+
+// POST /api/review-replies/:id/publish  Body: { reply } — posts the reply
+// under the review on Google. Our reviews come from DataForSEO, so we find
+// the same review on Google by reviewer name and wording.
+app.post('/api/review-replies/:id/publish', requireAuth, async (req, res) => {
+  try {
+    if (!gbpConnectEnabled(req.customer.email)) return res.status(503).json({ error: 'Posting replies to Google is not available yet.' });
+    const found = await pool.query(
+      `SELECT rr.*, tl.gbp_location_name, tl.customer_id FROM review_replies rr
+         JOIN tracked_listings tl ON tl.id = rr.tracked_listing_id
+        WHERE rr.id = $1 AND tl.customer_id = $2`,
+      [req.params.id, req.customer.id]
+    );
+    const row = found.rows[0];
+    if (!row) return res.status(404).json({ error: 'Review not found' });
+    if (row.posted_to_google_at) return res.status(409).json({ error: 'You already replied to this review on Google.' });
+    if (!row.gbp_location_name) return res.status(400).json({ error: 'Pick which Google listing this is in Step 1B first.' });
+
+    const reply = String(req.body?.reply || row.ai_draft_reply || '').trim();
+    if (!reply) return res.status(400).json({ error: 'Type a reply first.' });
+    if (reply.length > 4000) return res.status(400).json({ error: 'That reply is too long for Google. Please shorten it.' });
+
+    let accessToken;
+    try {
+      accessToken = await getGbpAccessToken(req.customer.id);
+    } catch (e) {
+      return res.status(401).json({ error: 'Your Google connection expired. Please tap Disconnect, then Connect Google again.' });
+    }
+    if (!accessToken) return res.status(400).json({ error: 'Connect Google first in Step 1B.' });
+
+    // Look through the newest Google reviews for this one.
+    const wantText = gbpNormalize(row.review_text).slice(0, 80);
+    const wantName = gbpNormalize(row.reviewer_name);
+    let googleReview = null;
+    let pageToken = '';
+    for (let page = 0; page < 4 && !googleReview; page++) {
+      const data = await gbpGoogleFetch(
+        accessToken,
+        `${GBP_V4}/${row.gbp_location_name}/reviews?pageSize=50&orderBy=updateTime%20desc${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`
+      );
+      const reviews = data.reviews || [];
+      googleReview = reviews.find((r) => wantText && gbpNormalize(r.comment).startsWith(wantText))
+        || reviews.find((r) => wantName && gbpNormalize(r.reviewer?.displayName) === wantName && wantText && gbpNormalize(r.comment).includes(wantText.slice(0, 30)));
+      pageToken = data.nextPageToken || '';
+      if (!pageToken) break;
+    }
+    if (!googleReview) {
+      return res.status(404).json({ error: 'We couldn\'t find this review on your Google listing. It may have been removed or edited. You can still copy the reply and paste it on Google.' });
+    }
+
+    await gbpGoogleFetch(accessToken, `${GBP_V4}/${googleReview.name}/reply`, { method: 'PUT', body: { comment: reply } });
+    await pool.query(
+      `UPDATE review_replies SET status = 'replied', posted_to_google_at = now(), posted_reply = $1 WHERE id = $2`,
+      [reply, row.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('review reply publish error:', err.message);
+    res.status(err.status ? 502 : 500).json({ error: err.status ? err.message : 'Could not post your reply right now.' });
   }
 });
 
@@ -12166,7 +12489,7 @@ app.get('/api/connections', requireAuth, async (req, res) => {
     const g = await pool.query(`SELECT connected_at FROM gbp_connections WHERE customer_id = $1`, [req.customer.id]);
     res.json({
       platforms: [
-        { key: 'google', name: 'Google Business Profile', what: 'Post to your Google listing and reply to reviews.', available: gbpConnectEnabled(), connected: g.rows.length > 0 },
+        { key: 'google', name: 'Google Business Profile', what: 'Post to your Google listing and reply to reviews.', available: gbpConnectEnabled(req.customer.email), connected: g.rows.length > 0 },
         { key: 'facebook', name: 'Facebook & Instagram', what: 'Post to your Facebook Page and Instagram on a schedule.', available: false, connected: false },
         { key: 'x', name: 'X', what: 'Post to your X account on a schedule.', available: false, connected: false },
         { key: 'googleAds', name: 'Google Ads', what: 'Let us watch your Google ads and send you weekly reports.', available: false, connected: false },
