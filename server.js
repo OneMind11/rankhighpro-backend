@@ -59,6 +59,24 @@ async function openaiImageFetch(body) {
   return last;
 }
 
+// ---------------------------------------------------------------------------
+// WHAT TO WRITE ABOUT
+// The owner's own words for the customers/services they want more of
+// (tracked_listings.keyword_focus, e.g. "commercial cleaning: offices,
+// churches"). Every AI post, ad, reply and photo follows it, so a business
+// that ranks for "house cleaning" but wants office accounts gets office posts.
+// ---------------------------------------------------------------------------
+function contentFocusLine(listing) {
+  const focus = String((listing && listing.keyword_focus) || '').trim();
+  if (!focus) return '';
+  return `\nWHAT THE OWNER WANTS TO PROMOTE (follow this closely; it outranks the keyword above): ${focus}`
+    + `\nOnly write about these customers and services. Do not mention or picture services the owner didn't list here.`;
+}
+function imageTopic(listing) {
+  const focus = String((listing && listing.keyword_focus) || '').trim();
+  return focus ? focus.slice(0, 300) : String((listing && listing.keyword) || '');
+}
+
 const app = express();
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
@@ -6414,7 +6432,7 @@ async function createHostedSite(listing) {
   const contentPrompt = `Write clean, semantic HTML for a single-page local business website homepage for:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they do / keyword: ${listing.keyword}
+What they do / keyword: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Return ONLY a complete, valid HTML document (starting with <!DOCTYPE html>) — no markdown fences, no explanation before or after.
@@ -6674,7 +6692,7 @@ app.post('/api/campaigns/:listingId/generate-message', requireAuth, async (req, 
     const prompt = `Write a short promotional text message (SMS) for this business to send to their own customers about a sale, update, or news:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Under 300 characters total (leave room for an unsubscribe line that gets added automatically after)
@@ -6718,7 +6736,7 @@ app.post('/api/campaigns/:listingId/generate-image', requireAuth, async (req, re
     }
     const listing = listingResult.rows[0];
 
-    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a text message marketing campaign from a small local business. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
+    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a text message marketing campaign from a small local business. Business type/category: "${imageTopic(listing)}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
     const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
     const data = await response.json();
@@ -6919,7 +6937,7 @@ app.post('/api/email-campaigns/:listingId/generate-content', requireAuth, async 
       ? `Write a warm, genuine storytelling email for this small business to send to their own customers — the kind of email that builds connection and brand loyalty, not a hard sell:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - A short, warm subject line
@@ -6930,7 +6948,7 @@ Requirements:
       : `Write a promotional sale/announcement email for this small business to send to their own customers:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - A short, attention-grabbing subject line mentioning the offer/news
@@ -7622,7 +7640,7 @@ app.post('/api/ai-visibility/:listingId/game-plan', requireAuth, async (req, res
 
 Business name: ${listing.business_name}
 Location: ${listing.location}
-Business type / what they're known for: ${listing.business_category || listing.keyword}
+Business type / what they're known for: ${listing.business_category || listing.keyword}${contentFocusLine(listing)}
 Website: ${listing.website_url || 'not on file'}
 Prompt that was asked to each AI: "${check.prompt_used}"
 
@@ -7677,7 +7695,7 @@ async function generateGbpPostContent(listing) {
   const prompt = `Write a short Google Business Profile post (an "update") for this business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for / tracked keyword: ${listing.keyword}
+What they're known for / tracked keyword: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - 150-300 characters, upbeat and specific, not generic
@@ -8395,6 +8413,7 @@ app.post('/api/ad-maker/scripts', requireAuth, async (req, res) => {
       `City / area: ${listing.location}${a.serviceArea ? ` (also serves: ${a.serviceArea})` : ''}`,
       `What they do: ${a.services || categories || listing.business_category || listing.keyword}`,
       `Search they want to win on Google: ${listing.keyword}`,
+      ...(listing.keyword_focus ? [`What the owner wants to promote (follow this closely): ${String(listing.keyword_focus).trim()}`] : []),
       phone ? `Phone: ${phone}` : 'Phone: not given (use the website or "search us on Google" instead)',
       website ? `Website: ${website}` : '',
       rating && reviews >= 5 ? `Google rating: ${rating} stars from ${reviews} reviews (true, may be mentioned)` : '',
@@ -9284,7 +9303,7 @@ async function generateGbpPostImage(listing) {
   }
 
   try {
-    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Google Business Profile post. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
+    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Google Business Profile post. Business type/category: "${imageTopic(listing)}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
     const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
 
@@ -9453,7 +9472,7 @@ async function generateSocialAdContent(listing) {
   const prompt = `Write Facebook/Instagram ad creative for this business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for / tracked keyword: ${listing.keyword}
+What they're known for / tracked keyword: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - A short, punchy headline (under 40 characters)
@@ -9511,7 +9530,7 @@ async function generateSocialAdImage(listing) {
   }
 
   try {
-    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Facebook and Instagram ad. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style, eye-catching for a social feed. Do not include any text, words, letters, or logos in the image.`;
+    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Facebook and Instagram ad. Business type/category: "${imageTopic(listing)}". Warm, inviting, high-quality commercial photography style, eye-catching for a social feed. Do not include any text, words, letters, or logos in the image.`;
 
     const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
 
@@ -9652,7 +9671,7 @@ const SOCIAL_POST_GOALS = {
     prompt: (listing) => `Write a short, upbeat social media post announcing a sale or promotion for this business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Under 200 characters, feels like a real small-business owner wrote it, not corporate copy
@@ -9665,7 +9684,7 @@ Requirements:
     prompt: (listing) => `Write a short social media post announcing a new product, service, or update for this business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Under 200 characters, upbeat and specific
@@ -9677,7 +9696,7 @@ Requirements:
     prompt: (listing) => `Write a short, friendly general social media post for this business — just a nice everyday post to stay visible and engaged with followers, no specific offer:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Under 200 characters, warm and genuine
@@ -9688,7 +9707,7 @@ Requirements:
     prompt: (listing) => `Write a short, genuine storytelling social media post for this business — the kind that builds real connection, not a sales pitch:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - 150-280 characters, tells a small, specific-feeling story — why the business started, a value they hold, a moment with a customer
@@ -9700,7 +9719,7 @@ Requirements:
     prompt: (listing) => `Write a short, genuinely interesting "did you know?" style social media post related to this business's industry — something that educates or surprises the reader, building authority without selling:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for: ${listing.keyword}
+What they're known for: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - Starts with or clearly implies "Did you know..."
@@ -9737,7 +9756,7 @@ async function generateSocialMediaPostImage(listing, goal) {
     const styleHint = goal === 'story' || goal === 'did_you_know'
       ? 'warm, editorial, storytelling photography style'
       : 'clean, appealing, professional commercial photography style';
-    const imagePrompt = `A ${styleHint} photo suitable for a small local business's social media post. Business type/category: "${listing.keyword}". Do not include any text, words, letters, or logos in the image.`;
+    const imagePrompt = `A ${styleHint} photo suitable for a small local business's social media post. Business type/category: "${imageTopic(listing)}". Do not include any text, words, letters, or logos in the image.`;
 
     const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
     const data = await response.json();
@@ -9967,7 +9986,7 @@ async function generateXPostContent(listing) {
   const prompt = `Write a single X (Twitter) post for this business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for / tracked keyword: ${listing.keyword}
+What they're known for / tracked keyword: ${listing.keyword}${contentFocusLine(listing)}
 
 Requirements:
 - MUST be under 280 characters total, ideally 200-260
@@ -10009,7 +10028,7 @@ async function generateXPostImage(listing) {
   }
 
   try {
-    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's X (Twitter) post. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
+    const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's X (Twitter) post. Business type/category: "${imageTopic(listing)}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
     const response = await openaiImageFetch({ prompt: imagePrompt, size: '1536x1024' });
 
@@ -10177,7 +10196,7 @@ async function generateCommunityPostContent(listing, platform, postType) {
   const prompt = `Write a single ${platformBrief.label} post for this local business:
 Business name: ${listing.business_name}
 Location: ${listing.location}
-What they're known for / tracked keyword: ${listing.keyword}
+What they're known for / tracked keyword: ${listing.keyword}${contentFocusLine(listing)}
 ${listing.reddit_subreddit ? `Target subreddit: r/${listing.reddit_subreddit}` : ''}
 ${listing.community_notes ? `Notes on brand voice / what to highlight: ${listing.community_notes}` : ''}
 
