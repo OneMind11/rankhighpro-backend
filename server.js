@@ -22,6 +22,43 @@ const crypto = require('crypto');
 const cron = require('node-cron');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+// ---------------------------------------------------------------------------
+// OPENAI PICTURES
+// OpenAI retires its picture models every few months (gpt-image-1 shut down
+// on Oct 23, 2026). This tries the newest model first and quietly falls back
+// to the next one if OpenAI says a model doesn't exist, so a retirement
+// can't break every photo on the dashboard again. To force a model, set
+// OPENAI_IMAGE_MODEL in Railway.
+// ---------------------------------------------------------------------------
+const OPENAI_IMAGE_MODELS = [
+  'gpt-image-2.6-flare',
+  'gpt-image-2.6-sunburst',
+  'gpt-image-2.5-flare',
+  'gpt-image-2',
+];
+async function openaiImageFetch(body) {
+  const models = [process.env.OPENAI_IMAGE_MODEL, ...OPENAI_IMAGE_MODELS].filter(Boolean)
+    .filter((m, i, all) => all.indexOf(m) === i);
+  let last = null;
+  for (const model of models) {
+    const response = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, model }),
+    });
+    let data = {};
+    try { data = await response.json(); } catch (e) { data = {}; }
+    last = { ok: response.ok, status: response.status, json: async () => data };
+    if (response.ok) return last;
+    const msg = String(data?.error?.message || '');
+    const code = String(data?.error?.code || '');
+    const modelGone = code === 'model_not_found' || /does not exist|not found|no access|do not have access|deprecated|retired|shut down/i.test(msg);
+    if (!modelGone) return last;
+    console.error(`OpenAI image model ${model} unavailable (${msg}), trying the next one`);
+  }
+  return last;
+}
+
 const app = express();
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
@@ -6683,11 +6720,7 @@ app.post('/api/campaigns/:listingId/generate-image', requireAuth, async (req, re
 
     const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a text message marketing campaign from a small local business. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-image-1', prompt: imagePrompt, size: '1024x1024' }),
-    });
+    const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
     const data = await response.json();
     if (!response.ok) {
       return res.status(502).json({ error: data?.error?.message || 'Could not generate an image right now.' });
@@ -9253,18 +9286,7 @@ async function generateGbpPostImage(listing) {
   try {
     const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Google Business Profile post. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-image-1',
-        prompt: imagePrompt,
-        size: '1024x1024',
-      }),
-    });
+    const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
 
     const data = await response.json();
 
@@ -9491,18 +9513,7 @@ async function generateSocialAdImage(listing) {
   try {
     const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's Facebook and Instagram ad. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style, eye-catching for a social feed. Do not include any text, words, letters, or logos in the image.`;
 
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-image-1',
-        prompt: imagePrompt,
-        size: '1024x1024',
-      }),
-    });
+    const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
 
     const data = await response.json();
 
@@ -9728,11 +9739,7 @@ async function generateSocialMediaPostImage(listing, goal) {
       : 'clean, appealing, professional commercial photography style';
     const imagePrompt = `A ${styleHint} photo suitable for a small local business's social media post. Business type/category: "${listing.keyword}". Do not include any text, words, letters, or logos in the image.`;
 
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-image-1', prompt: imagePrompt, size: '1024x1024' }),
-    });
+    const response = await openaiImageFetch({ prompt: imagePrompt, size: '1024x1024' });
     const data = await response.json();
     if (!response.ok) {
       return { imageBase64: null, error: data?.error?.message || `OpenAI returned HTTP ${response.status}` };
@@ -10004,18 +10011,7 @@ async function generateXPostImage(listing) {
   try {
     const imagePrompt = `A clean, appealing, professional product/lifestyle photo suitable for a small local business's X (Twitter) post. Business type/category: "${listing.keyword}". Warm, inviting, high-quality commercial photography style. Do not include any text, words, letters, or logos in the image.`;
 
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-image-1',
-        prompt: imagePrompt,
-        size: '1536x1024',
-      }),
-    });
+    const response = await openaiImageFetch({ prompt: imagePrompt, size: '1536x1024' });
 
     const data = await response.json();
 
