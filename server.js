@@ -558,6 +558,9 @@ async function initDb() {
   // Which Google listing (accounts/X/locations/Y) each RankHighPro listing
   // posts to, plus what happened when we posted or replied on Google.
   await pool.query(`ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS gbp_location_name TEXT;`);
+  // When the 7-day free trial ends (NULL = not on a trial). Video ads stay
+  // locked until then, because each video costs real money to make.
+  await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE tracked_listings ADD COLUMN IF NOT EXISTS gbp_location_title TEXT;`);
   await pool.query(`ALTER TABLE gbp_posts ADD COLUMN IF NOT EXISTS google_post_name TEXT;`);
   await pool.query(`ALTER TABLE gbp_posts ADD COLUMN IF NOT EXISTS posted_to_google_at TIMESTAMPTZ;`);
@@ -1467,6 +1470,21 @@ app.post(
               [email, session.customer, session.subscription, plan]
             );
             console.log('Customer activated:', email, plan);
+            // Remember when the free trial ends, so video ads unlock then.
+            try {
+              let trialEnd = null;
+              if (session.subscription) {
+                const sub = await stripe.subscriptions.retrieve(session.subscription);
+                if (sub && sub.status === 'trialing' && sub.trial_end) trialEnd = sub.trial_end;
+              }
+              if (trialEnd) {
+                await pool.query(`UPDATE customers SET trial_ends_at = to_timestamp($1) WHERE id = $2`, [trialEnd, upsertResult.rows[0].id]);
+              } else {
+                await pool.query(`UPDATE customers SET trial_ends_at = NULL WHERE id = $1`, [upsertResult.rows[0].id]);
+              }
+            } catch (trialErr) {
+              console.error('trial end lookup failed:', trialErr.message);
+            }
             if (plan === 'fullservice') {
               onManagedSignup(upsertResult.rows[0].id, email).catch((e) => console.error('onManagedSignup error:', e.message));
             }
@@ -1519,6 +1537,9 @@ app.post(
           const invoice = event.data.object;
           const amountPaidCents = invoice.amount_paid || 0;
           if (amountPaidCents > 0) {
+            // A real payment means the free trial is over: video ads unlock.
+            await pool.query(`UPDATE customers SET trial_ends_at = NULL WHERE stripe_customer_id = $1`, [invoice.customer])
+              .catch((e) => console.error('trial clear failed:', e.message));
             const customerResult = await pool.query(
               `SELECT id, plan, status FROM customers WHERE stripe_customer_id = $1`,
               [invoice.customer]
@@ -2202,7 +2223,8 @@ app.post('/api/subscription/change-plan', requireAuth, async (req, res) => {
 
     const isUpgrade = PLAN_ORDER.indexOf(newPlan) > PLAN_ORDER.indexOf(customer.plan);
     const newName = TIER_DISPLAY_NAMES[newPlan] || newPlan;
-    const newPrice = (PLANS[newPlan].amountCents / 100).toFixed(0);
+    let newPrice = (PLANS[newPlan].amountCents / 100).toFixed(0);
+    let per = 'month';
 
     // Exclusivity: moving onto Grow, Pro or Fully Managed needs the local
     // spot for each of their listings to be free.
@@ -2227,6 +2249,12 @@ app.post('/api/subscription/change-plan', requireAuth, async (req, res) => {
     }
     const item = sub.items.data[0];
     const trialing = sub.status === 'trialing';
+    // Yearly customers stay yearly when they change plans (Fully Managed is
+    // monthly only, so moving onto it switches them to monthly billing).
+    const billing = item && item.price && item.price.recurring && item.price.recurring.interval === 'year'
+      && PLANS[newPlan].yearlyCents ? 'yearly' : 'monthly';
+    newPrice = (planPriceCents(newPlan, billing) / 100).toFixed(0);
+    per = billing === 'yearly' ? 'year' : 'month';
     const periodEnd = sub.current_period_end || (item && item.current_period_end);
     const endsAtPeriodEnd = !!sub.cancel_at_period_end;
 
@@ -2235,11 +2263,11 @@ app.post('/api/subscription/change-plan', requireAuth, async (req, res) => {
     if (trialing && newPlan === 'fullservice') {
       message = `Fully Managed has no free trial, so your trial ends now and you'll be charged $${newPrice} today, then $${newPrice} every month.`;
     } else if (trialing) {
-      message = `You're still in your free trial, so nothing is charged today. When your trial ends on ${formatStripeDate(sub.trial_end)}, you'll be billed $${newPrice}/month for the ${newName}.`;
+      message = `You're still in your free trial, so nothing is charged today. When your trial ends on ${formatStripeDate(sub.trial_end)}, you'll be billed $${newPrice}/${per} for the ${newName}.`;
     } else if (isUpgrade) {
-      message = `You'll be charged today for the difference in price for the rest of this billing period (until ${formatStripeDate(periodEnd)}). After that, the ${newName} is $${newPrice}/month.`;
+      message = `You'll be charged today for the difference in price for the rest of this billing period (until ${formatStripeDate(periodEnd)}). After that, the ${newName} is $${newPrice}/${per}.`;
     } else {
-      message = `The unused part of your current plan becomes a credit on your next bill. After that, the ${newName} is $${newPrice}/month. Tools that aren't part of the ${newName} close right away.`;
+      message = `The unused part of your current plan becomes a credit on your next bill. After that, the ${newName} is $${newPrice}/${per}. Tools that aren't part of the ${newName} close right away.`;
     }
     if (endsAtPeriodEnd) {
       message += ' Changing plans also turns your scheduled cancellation off, so your plan will keep renewing.';
@@ -2256,11 +2284,11 @@ app.post('/api/subscription/change-plan', requireAuth, async (req, res) => {
         price_data: {
           currency: 'usd',
           product: productId,
-          unit_amount: PLANS[newPlan].amountCents,
-          recurring: { interval: 'month' },
+          unit_amount: planPriceCents(newPlan, billing),
+          recurring: { interval: billing === 'yearly' ? 'year' : 'month' },
         },
       }],
-      metadata: { ...(sub.metadata || {}), plan: newPlan },
+      metadata: { ...(sub.metadata || {}), plan: newPlan, billing },
       cancel_at_period_end: false,
       // Upgrades are paid now (so nobody upgrades, uses it and leaves before
       // the next bill); downgrades become a credit on the next bill.
@@ -2312,7 +2340,9 @@ app.post('/api/subscription/change-plan', requireAuth, async (req, res) => {
 app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
     const customerResult = await pool.query(
-      `SELECT id, email, plan, status FROM customers WHERE id = $1`,
+      `SELECT id, email, plan, status,
+              CASE WHEN trial_ends_at > now() THEN trial_ends_at END AS trial_ends_at
+         FROM customers WHERE id = $1`,
       [req.customer.id]
     );
     const customer = customerResult.rows[0];
@@ -2866,12 +2896,22 @@ app.patch('/api/review-requests/:id/mark-reviewed', requireAuth, async (req, res
 // ---------------------------------------------------------------------------
 // PRICING TIERS
 // ---------------------------------------------------------------------------
+// yearlyCents = 10 months' price (2 months free). Fully Managed is monthly
+// only, because it's priced on Ty's hands-on hours each month.
+// legacyCents = older prices that existing customers may still be paying
+// (Fully Managed was $600 until Nov 2026), so Stripe re-checks still
+// recognise their plan.
 const PLANS = {
-  watch: { name: 'RankHighPro Watch', amountCents: 4900 },
-  grow: { name: 'RankHighPro Grow', amountCents: 14900 },
-  managed: { name: 'RankHighPro Pro', amountCents: 39900 },
-  fullservice: { name: 'RankHighPro Fully Managed By Us', amountCents: 60000 },
+  watch: { name: 'RankHighPro Watch', amountCents: 4900, yearlyCents: 49000 },
+  grow: { name: 'RankHighPro Grow', amountCents: 14900, yearlyCents: 149000 },
+  managed: { name: 'RankHighPro Pro', amountCents: 39900, yearlyCents: 399000 },
+  fullservice: { name: 'RankHighPro Fully Managed By Us', amountCents: 69900, yearlyCents: null, legacyCents: [60000] },
 };
+function planPriceCents(plan, billing) {
+  const p = PLANS[plan];
+  if (!p) return null;
+  return billing === 'yearly' && p.yearlyCents ? p.yearlyCents : p.amountCents;
+}
 
 // ---------------------------------------------------------------------------
 // AFFILIATE PROGRAM
@@ -3019,14 +3059,17 @@ const TIER_DISPLAY_NAMES = {
 // back to the Watch limits as the safest default.
 // ---------------------------------------------------------------------------
 const TIER_LIMITS = {
-  watch:       { aiContentPerMonth: 2,    gbpPostsPerMonth: 4,    reviewRequestsPerMonth: null, supportChatPerMonth: 40,  extraKeywordsLimit: 0, videoAdsPerMonth: 1 },
-  grow:        { aiContentPerMonth: 6,    gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: 100, extraKeywordsLimit: 4, videoAdsPerMonth: 3 },
-  managed:     { aiContentPerMonth: null, gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: null, extraKeywordsLimit: 5, videoAdsPerMonth: 6 },
+  // "Unlimited" plans have a quiet fair-use cap (FAIR_USE below) so one
+  // very heavy account can't run up the AI bills. Real customers never
+  // get near it; the homepage still says unlimited.
+  watch:       { aiContentPerMonth: 2,    gbpPostsPerMonth: 4,    reviewRequestsPerMonth: null, supportChatPerMonth: 40,  extraKeywordsLimit: 0, videoAdsPerMonth: 1,  socialPostsPerMonth: 0 },
+  grow:        { aiContentPerMonth: 6,    gbpPostsPerMonth: 100,  reviewRequestsPerMonth: null, supportChatPerMonth: 100, extraKeywordsLimit: 4, videoAdsPerMonth: 3,  socialPostsPerMonth: 100, fairUse: ['gbpPosts', 'socialPosts'] },
+  managed:     { aiContentPerMonth: 100,  gbpPostsPerMonth: 100,  reviewRequestsPerMonth: null, supportChatPerMonth: 1000, extraKeywordsLimit: 5, videoAdsPerMonth: 6, socialPostsPerMonth: 100, fairUse: ['aiContent', 'gbpPosts', 'supportChat', 'socialPosts'] },
   // Fully Managed By Us customers don't touch most self-serve tools
   // directly (the dashboard hides them entirely — see the stripped-down
   // view keyed on plan === 'fullservice'), so most limits here are moot,
   // but videoAdsPerMonth IS used — this feature is offered to them too.
-  fullservice: { aiContentPerMonth: null, gbpPostsPerMonth: null, reviewRequestsPerMonth: null, supportChatPerMonth: null, extraKeywordsLimit: 5, videoAdsPerMonth: 10 },
+  fullservice: { aiContentPerMonth: 100,  gbpPostsPerMonth: 100,  reviewRequestsPerMonth: null, supportChatPerMonth: 1000, extraKeywordsLimit: 5, videoAdsPerMonth: 10, socialPostsPerMonth: 100, fairUse: ['aiContent', 'gbpPosts', 'supportChat', 'socialPosts'] },
 };
 
 // ---------------------------------------------------------------------------
@@ -3148,6 +3191,39 @@ async function checkFeatureAllowed(customerId, feature) {
   }
 
   const limits = TIER_LIMITS[plan] || TIER_LIMITS.watch;
+  // Friendly wording when an "unlimited" plan reaches its fair-use cap.
+  const fairUseHit = (what) => ({
+    allowed: false,
+    fairUse: true,
+    error: `You've reached this month's fair-use limit for ${what}. It resets on the 1st. Need more sooner? Message our team from your dashboard and we'll take care of you.`,
+  });
+
+  if (feature === 'videoAds' || feature === 'videoTwin') {
+    const trial = await pool.query(`SELECT trial_ends_at FROM customers WHERE id = $1 AND trial_ends_at > now()`, [customerId]);
+    if (trial.rows.length > 0) {
+      return {
+        allowed: false,
+        trial: true,
+        trialEndsAt: trial.rows[0].trial_ends_at,
+        error: 'Video ads are frozen during your free trial. This unlocks when you join the best platform ever.',
+      };
+    }
+    if (feature === 'videoTwin') return { allowed: true };
+  }
+
+  if (feature === 'socialPosts') {
+    if (!limits.socialPostsPerMonth) {
+      return { allowed: false, error: 'Social media marketing content is available on the Grow and Pro Plans. Upgrade to unlock this feature.' };
+    }
+    const used = await countRows(
+      `SELECT COUNT(*) FROM social_media_posts smp
+       JOIN tracked_listings tl ON tl.id = smp.tracked_listing_id
+       WHERE tl.customer_id = $1 AND smp.created_at >= date_trunc('month', now())`,
+      [customerId]
+    );
+    if (used >= limits.socialPostsPerMonth) return fairUseHit('social media posts');
+    return { allowed: true };
+  }
 
   if (feature === 'aiContent') {
     if (limits.aiContentPerMonth === null) return { allowed: true };
@@ -3165,6 +3241,7 @@ async function checkFeatureAllowed(customerId, feature) {
     );
     const used = adCount + xCount;
     if (used >= limits.aiContentPerMonth) {
+      if ((limits.fairUse || []).includes('aiContent')) return fairUseHit('AI ads and X posts');
       return {
         allowed: false,
         error: `You've used all ${limits.aiContentPerMonth} AI ad/post generation${limits.aiContentPerMonth === 1 ? '' : 's'} included in your ${plan} plan this month. Upgrade your plan for more.`,
@@ -3182,6 +3259,7 @@ async function checkFeatureAllowed(customerId, feature) {
       [customerId]
     );
     if (used >= limits.gbpPostsPerMonth) {
+      if ((limits.fairUse || []).includes('gbpPosts')) return fairUseHit('Google posts');
       return {
         allowed: false,
         error: `You've used all ${limits.gbpPostsPerMonth} GBP post${limits.gbpPostsPerMonth === 1 ? '' : 's'} included in your ${plan} plan this month. Upgrade your plan for more.`,
@@ -3214,6 +3292,7 @@ async function checkFeatureAllowed(customerId, feature) {
       [customerId]
     );
     if (used >= limits.supportChatPerMonth) {
+      if ((limits.fairUse || []).includes('supportChat')) return fairUseHit('AI assistant messages');
       return {
         allowed: false,
         error: `You've used all ${limits.supportChatPerMonth} AI assistant messages included in your ${plan} plan this month. Upgrade your plan for more.`,
@@ -3260,6 +3339,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
   try {
     const { plan, email, referralCode } = req.body;
     const selected = PLANS[plan];
+    // Yearly = pay 10 months, get 12. Fully Managed stays monthly.
+    const billing = req.body.billing === 'yearly' && selected && selected.yearlyCents ? 'yearly' : 'monthly';
 
     if (!selected) {
       return res.status(400).json({ error: 'Unknown plan: ' + plan });
@@ -3301,7 +3382,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       payment_method_types: ['card'],
       customer_email: email,
-      metadata: { plan, referral_code },
+      metadata: { plan, referral_code, billing },
       allow_promotion_codes: true,
       // Fully Managed By Us is white-glove, hands-on work on our end from
       // day one — no free trial on that tier. Every other tier keeps the
@@ -3313,9 +3394,9 @@ app.post('/api/create-checkout-session', async (req, res) => {
         {
           price_data: {
             currency: 'usd',
-            product_data: { name: selected.name },
-            unit_amount: selected.amountCents,
-            recurring: { interval: 'month' },
+            product_data: { name: billing === 'yearly' ? `${selected.name} (yearly)` : selected.name },
+            unit_amount: planPriceCents(plan, billing),
+            recurring: { interval: billing === 'yearly' ? 'year' : 'month' },
           },
           quantity: 1,
         },
@@ -7850,7 +7931,7 @@ app.post('/api/video-ads/generate', requireAuth, async (req, res) => {
 
     const quota = await checkFeatureAllowed(req.customer.id, 'videoAds');
     if (!quota.allowed) {
-      return res.status(403).json({ error: quota.error });
+      return res.status(403).json({ error: quota.error, trial: !!quota.trial });
     }
 
     // Only HeyGen's public stock presenters, or this customer's OWN twin,
@@ -8697,6 +8778,8 @@ app.post('/api/ad-maker/twin/upload', requireAuth, async (req, res) => {
     const { plan, status } = await getCustomerPlanStatus(req.customer.id);
     const limits = TIER_LIMITS[plan] || TIER_LIMITS.watch;
     if (status !== 'active' || limits.videoAdsPerMonth === 0) return res.status(403).json({ error: 'Digital twins come with video ads on an active plan.' });
+    const trialCheck = await checkFeatureAllowed(req.customer.id, 'videoTwin');
+    if (!trialCheck.allowed) return res.status(403).json({ error: trialCheck.error, trial: !!trialCheck.trial });
 
     const len = Number(req.headers['content-length'] || 0);
     if (len > TWIN_MAX_BYTES) return res.status(413).json({ error: 'That video is too big (over 200 MB). Please record about 1 minute instead.' });
@@ -9778,9 +9861,9 @@ async function generateSocialMediaPostImage(listing, goal) {
 // ---------------------------------------------------------------------------
 app.post('/api/social-media-posts/:listingId/generate', requireAuth, async (req, res) => {
   try {
-    const { plan } = await getCustomerPlanStatus(req.customer.id);
-    if (plan === 'watch') {
-      return res.status(403).json({ error: 'Social media marketing content is available on the Grow and Pro Plans. Upgrade to unlock this feature.' });
+    const quota = await checkFeatureAllowed(req.customer.id, 'socialPosts');
+    if (!quota.allowed) {
+      return res.status(403).json({ error: quota.error });
     }
 
     const { goal } = req.body;
@@ -10568,7 +10651,7 @@ async function onManagedSignup(customerId, email) {
   }
   notifyAdmin(
     `New Fully Managed client: ${email}`,
-    `<p><strong>A new Fully Managed client just signed up ($600/month, billed today).</strong></p>
+    `<p><strong>A new Fully Managed client just signed up ($699/month, billed today).</strong></p>
      <p>Email: ${htmlEsc(email)}<br>Welcome email with the setup steps: ${alreadySentAt ? `already sent on ${new Date(alreadySentAt).toLocaleDateString('en-US')}, not sent again` : sent ? 'sent' : '<strong>NOT sent (check RESEND_API_KEY)</strong>'}</p>
      <p><strong>Do today:</strong></p>
      <ol>
@@ -11035,7 +11118,8 @@ function planFromStripeSubscription(sub, product) {
   const keys = Object.keys(PLANS);
   const item = sub && sub.items && sub.items.data && sub.items.data[0];
   const amount = item && item.price ? item.price.unit_amount : null;
-  const byAmount = keys.find((k) => PLANS[k].amountCents === amount);
+  const byAmount = keys.find((k) => PLANS[k].amountCents === amount || PLANS[k].yearlyCents === amount
+    || (PLANS[k].legacyCents || []).includes(amount));
   if (byAmount) return byAmount;
   if (product && product.metadata && keys.includes(product.metadata.rhp_plan)) return product.metadata.rhp_plan;
   const name = (product && product.name) || '';
